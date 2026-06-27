@@ -35,3 +35,9 @@ build/
 # Temporary files
 tmp/
 *.tmp
+
+# Data files (CSV)
+*.csv
+assets/comments/
+assets/uploads/
+src/assets/comments/
