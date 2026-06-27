@@ -1,0 +1,1329 @@
+import argparse
+import asyncio
+import json
+import os
+import threading
+import traceback
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Iterable, AsyncIterable, AsyncGenerator, Optional
+import cozeloop
+import uvicorn
+import time
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
+from coze_coding_utils.runtime_ctx.context import new_context, Context
+from coze_coding_utils.helper import graph_helper
+from coze_coding_utils.log.node_log import LOG_FILE
+from coze_coding_utils.log.write_log import setup_logging, request_context
+from coze_coding_utils.log.config import LOG_LEVEL
+from coze_coding_utils.error.classifier import ErrorClassifier, classify_error
+from coze_coding_utils.helper.stream_runner import AgentStreamRunner, WorkflowStreamRunner,agent_stream_handler,workflow_stream_handler, RunOpt
+from storage.database.db import get_session, get_engine
+from storage.memory.memory_saver import get_memory_saver
+from storage.database.shared.model import Base
+from coze_coding_utils.async_tasks import (
+    AsyncTaskRuntime,
+    AsyncTaskStorageError,
+    extract_biz_context,
+    parse_deadline_sec,
+)
+from coze_coding_utils.async_tasks import config as async_task_config
+from coze_coding_utils.async_tasks.headers import HEADER_X_RUN_ID as _ASYNC_HEADER_X_RUN_ID
+from coze_coding_utils.runtime_ctx.context import new_context as _new_async_ctx
+from sqlalchemy import event, func
+
+setup_logging(
+    log_file=LOG_FILE,
+    max_bytes=100 * 1024 * 1024, # 100MB
+    backup_count=5,
+    log_level=LOG_LEVEL,
+    use_json_format=True,
+    console_output=True
+)
+
+logger = logging.getLogger(__name__)
+from coze_coding_utils.helper.agent_helper import to_stream_input
+from coze_coding_utils.openai.handler import OpenAIChatHandler
+from coze_coding_utils.log.parser import LangGraphParser
+from coze_coding_utils.log.err_trace import extract_core_stack
+from coze_coding_utils.log.loop_trace import init_run_config, init_agent_config
+
+
+# 超时配置常量
+TIMEOUT_SECONDS = 900  # 15分钟
+
+class GraphService:
+    def __init__(self):
+        # 用于跟踪正在运行的任务（使用asyncio.Task）
+        self.running_tasks: Dict[str, asyncio.Task] = {}
+        # 错误分类器
+        self.error_classifier = ErrorClassifier()
+        # stream runner
+        self._agent_stream_runner = AgentStreamRunner()
+        self._workflow_stream_runner = WorkflowStreamRunner()
+        self._graph = None
+        self._graph_lock = threading.Lock()
+
+    def set_graph(self, graph) -> None:
+        """Inject the compiled graph used by sync endpoints. Called once from
+        lifespan with a no-checkpointer build, so /run /stream_run /node_run
+        never hit the checkpoint DB."""
+        self._graph = graph
+
+    def _get_graph(self, ctx=Context):
+        if self._graph is not None:
+            return self._graph
+        with self._graph_lock:
+            if self._graph is not None:
+                return self._graph
+            if graph_helper.is_agent_proj():
+                self._graph = graph_helper.get_agent_instance("agents.agent", ctx)
+            else:
+                self._graph = graph_helper.get_graph_instance("graphs.graph")
+            return self._graph
+
+    @staticmethod
+    def _sse_event(data: Any, event_id: Any = None) -> str:
+        id_line = f"id: {event_id}\n" if event_id else ""
+        return f"{id_line}event: message\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+    def _get_stream_runner(self):
+        if graph_helper.is_agent_proj():
+            return self._agent_stream_runner
+        else:
+            return self._workflow_stream_runner
+
+    # 流式运行（原始迭代器）：本地调用使用
+    def stream(self, payload: Dict[str, Any], run_config: RunnableConfig, ctx=Context) -> Iterable[Any]:
+        graph = self._get_graph(ctx)
+        stream_runner = self._get_stream_runner()
+        for chunk in stream_runner.stream(payload, graph, run_config, ctx):
+            yield chunk
+
+    # 同步运行：本地/HTTP 通用
+    async def run(self, payload: Dict[str, Any], ctx=None) -> Dict[str, Any]:
+        if ctx is None:
+            ctx = new_context("run")
+
+        run_id = ctx.run_id
+        logger.info(f"Starting run with run_id: {run_id}")
+
+        try:
+            graph = self._get_graph(ctx)
+            # custom tracer
+            run_config = init_run_config(graph, ctx)
+            run_config.setdefault("configurable", {})["thread_id"] = ctx.run_id
+
+            # 直接调用，LangGraph会在当前任务上下文中执行
+            # 如果当前任务被取消，LangGraph的执行也会被取消
+            return await graph.ainvoke(payload, config=run_config, context=ctx)
+
+        except asyncio.CancelledError:
+            logger.info(f"Run {run_id} was cancelled")
+            return {"status": "cancelled", "run_id": run_id, "message": "Execution was cancelled"}
+        except Exception as e:
+            # 使用错误分类器分类错误
+            err = self.error_classifier.classify(e, {"node_name": "run", "run_id": run_id})
+            # 记录详细的错误信息和堆栈跟踪
+            logger.error(
+                f"Error in GraphService.run: [{err.code}] {err.message}\n"
+                f"Category: {err.category.name}\n"
+                f"Traceback:\n{extract_core_stack()}"
+            )
+            # 保留原始异常堆栈，便于上层返回真正的报错位置
+            raise
+        finally:
+            # 清理任务记录
+            self.running_tasks.pop(run_id, None)
+
+    # 流式运行（SSE 格式化）：HTTP 路由使用
+    async def stream_sse(self, payload: Dict[str, Any], ctx=None, run_opt: Optional[RunOpt] = None) -> AsyncGenerator[str, None]:
+        if ctx is None:
+            ctx = new_context(method="stream_sse")
+        if run_opt is None:
+            run_opt = RunOpt()
+
+        run_id = ctx.run_id
+        logger.info(f"Starting stream with run_id: {run_id}")
+        graph = self._get_graph(ctx)
+        if graph_helper.is_agent_proj():
+            run_config = init_agent_config(graph, ctx)
+        else:
+            run_config = init_run_config(graph, ctx)  # vibeflow
+
+        is_workflow = not graph_helper.is_agent_proj()
+
+        try:
+            async for chunk in self.astream(payload, graph, run_config=run_config, ctx=ctx, run_opt=run_opt):
+                if is_workflow and isinstance(chunk, tuple):
+                    event_id, data = chunk
+                    yield self._sse_event(data, event_id)
+                else:
+                    yield self._sse_event(chunk)
+        finally:
+            # 清理任务记录
+            self.running_tasks.pop(run_id, None)
+            cozeloop.flush()
+
+    # 取消执行 - 使用asyncio的标准方式
+    def cancel_run(self, run_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """
+        取消指定run_id的执行
+
+        使用asyncio.Task.cancel()来取消任务,这是标准的Python异步取消机制。
+        LangGraph会在节点之间检查CancelledError,实现优雅的取消。
+        """
+        logger.info(f"Attempting to cancel run_id: {run_id}")
+
+        # 查找对应的任务
+        if run_id in self.running_tasks:
+            task = self.running_tasks[run_id]
+            if not task.done():
+                # 使用asyncio的标准取消机制
+                # 这会在下一个await点抛出CancelledError
+                task.cancel()
+                logger.info(f"Cancellation requested for run_id: {run_id}")
+                return {
+                    "status": "success",
+                    "run_id": run_id,
+                    "message": "Cancellation signal sent, task will be cancelled at next await point"
+                }
+            else:
+                logger.info(f"Task already completed for run_id: {run_id}")
+                return {
+                    "status": "already_completed",
+                    "run_id": run_id,
+                    "message": "Task has already completed"
+                }
+        else:
+            logger.warning(f"No active task found for run_id: {run_id}")
+            return {
+                "status": "not_found",
+                "run_id": run_id,
+                "message": "No active task found with this run_id. Task may have already completed or run_id is invalid."
+            }
+
+    # 运行指定节点：本地/HTTP 通用
+    async def run_node(self, node_id: str, payload: Dict[str, Any], ctx=None) -> Any:
+        if ctx is None or Context.run_id == "":
+            ctx = new_context(method="node_run")
+
+        _graph = self._get_graph()
+        node_func, input_cls, output_cls = graph_helper.get_graph_node_func_with_inout(_graph.get_graph(), node_id)
+        if node_func is None or input_cls is None:
+            raise KeyError(f"node_id '{node_id}' not found")
+
+        parser = LangGraphParser(_graph)
+        metadata = parser.get_node_metadata(node_id) or {}
+
+        _g = StateGraph(input_cls, input_schema=input_cls, output_schema=output_cls)
+        _g.add_node("sn", node_func, metadata=metadata)
+        _g.set_entry_point("sn")
+        _g.add_edge("sn", END)
+        _graph = _g.compile()
+
+        run_config = init_run_config(_graph, ctx)
+        return await _graph.ainvoke(payload, config=run_config)
+
+    def graph_inout_schema(self) -> Any:
+        if graph_helper.is_agent_proj():
+            return {"input_schema": {}, "output_schema": {}}
+        builder = getattr(self._get_graph(), 'builder', None)
+        if builder is not None:
+            input_cls = getattr(builder, 'input_schema', None) or self.graph.get_input_schema()
+            output_cls = getattr(builder, 'output_schema', None) or self.graph.get_output_schema()
+        else:
+            logger.warning(f"No builder input schema found for graph_inout_schema, using graph input schema instead")
+            input_cls = self.graph.get_input_schema()
+            output_cls = self.graph.get_output_schema()
+
+        return {
+            "input_schema": input_cls.model_json_schema(), 
+            "output_schema": output_cls.model_json_schema(),
+            "code":0,
+            "msg":""
+        }
+
+    async def astream(self, payload: Dict[str, Any], graph: CompiledStateGraph, run_config: RunnableConfig, ctx=Context, run_opt: Optional[RunOpt] = None) -> AsyncIterable[Any]:
+        stream_runner = self._get_stream_runner()
+        async for chunk in stream_runner.astream(payload, graph, run_config, ctx, run_opt):
+            yield chunk
+
+
+service = GraphService()
+
+async_runtime: Optional[AsyncTaskRuntime] = None
+async_graph: Optional[CompiledStateGraph] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = get_engine()
+    @event.listens_for(engine, "connect")
+    def _set_utc(dbapi_conn, _):
+        with dbapi_conn.cursor() as cur:
+            cur.execute("SET TIME ZONE 'UTC'")
+    checkpointer = get_memory_saver()
+    if graph_helper.is_agent_proj():
+        base = graph_helper.get_agent_instance("agents.agent", None)
+        sync_graph = base.builder.compile(checkpointer=checkpointer)
+    else:
+        base = graph_helper.get_graph_instance("graphs.graph")
+        sync_graph = base.builder.compile()
+    global async_graph, async_runtime
+    async_graph = base.builder.compile(checkpointer=checkpointer)
+    service.set_graph(sync_graph)
+    async_runtime = AsyncTaskRuntime(
+        session_factory=get_session, engine=engine,
+        graph=async_graph, checkpointer=checkpointer,
+    )
+    yield
+    if async_runtime is not None:
+        await async_runtime.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+
+# OpenAI 兼容接口处理器
+openai_handler = OpenAIChatHandler(service)
+
+
+@app.post("/async_run")
+async def http_async_run(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_async_run: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {extract_core_stack()}")
+    try:
+        deadline_sec = parse_deadline_sec(request.headers)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 一个 ID 走到底：task_id == run_id == thread_id == ctx.run_id == coze_run_id。
+    # 优先用上游 x-run-id；没传就生成 UUID。
+    run_id = request.headers.get(_ASYNC_HEADER_X_RUN_ID) or uuid.uuid4().hex
+
+    # ctx 在 handler scope 构造，与同步 /run 路径一致；后面 new_context 默认会
+    # 给 run_id 一个新 UUID，同步路径也是显式覆盖（main.py /run 处），这里同理。
+    ctx = _new_async_ctx(method="async_run", headers=request.headers)
+    ctx.run_id = run_id
+    request_context.set(ctx)  # 与其他 HTTP endpoint 一致：让日志组件拿到 run_id 等信息
+    run_config = init_run_config(async_graph, ctx)
+    run_config["recursion_limit"] = async_task_config.RECURSION_LIMIT
+    run_config.setdefault("configurable", {})["thread_id"] = run_id
+
+    biz_context = extract_biz_context(request.headers) or {}
+    biz_context[_ASYNC_HEADER_X_RUN_ID] = run_id  # 也留 DB 一份方便审计/排查
+
+    try:
+        return await async_runtime.submit(
+            task_id=run_id,
+            payload=payload,
+            biz_context=biz_context,
+            deadline_sec=deadline_sec,
+            run_config=run_config,
+            ctx=ctx,
+        )
+    except AsyncTaskStorageError as e:
+        raise HTTPException(status_code=503,
+                            detail=f"async-task storage unavailable: {e}")
+
+
+@app.get("/task/{task_id}")
+async def http_get_task(task_id: str) -> dict:
+    try:
+        row = await async_runtime.get(task_id)
+    except AsyncTaskStorageError as e:
+        raise HTTPException(status_code=503,
+                            detail=f"async-task storage unavailable: {e}")
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return row
+
+
+HEADER_X_RUN_ID = "x-run-id"
+@app.post("/run")
+async def http_run(request: Request) -> Dict[str, Any]:
+    global result
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except Exception as e:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid JSON format: {body_text}, traceback: {traceback.format_exc()}, error: {e}")
+
+    ctx = new_context(method="run", headers=request.headers)
+    # 优先使用上游指定的 run_id，保证 cancel 能精确匹配
+    upstream_run_id = request.headers.get(HEADER_X_RUN_ID)
+    if upstream_run_id:
+        ctx.run_id = upstream_run_id
+    run_id = ctx.run_id
+    request_context.set(ctx)
+
+    logger.info(
+        f"Received request for /run: "
+        f"run_id={run_id}, "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}"
+    )
+
+    try:
+        payload = await request.json()
+
+        # 创建任务并记录 - 这是关键，让我们可以通过run_id取消任务
+        task = asyncio.create_task(service.run(payload, ctx))
+        service.running_tasks[run_id] = task
+
+        try:
+            result = await asyncio.wait_for(task, timeout=float(TIMEOUT_SECONDS))
+        except asyncio.TimeoutError:
+            logger.error(f"Run execution timeout after {TIMEOUT_SECONDS}s for run_id: {run_id}")
+            task.cancel()
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                return {
+                    "status": "timeout",
+                    "run_id": run_id,
+                    "message": f"Execution timeout: exceeded {TIMEOUT_SECONDS} seconds"
+                }
+
+        if not result:
+            result = {}
+        if isinstance(result, dict):
+            result["run_id"] = run_id
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format, {extract_core_stack()}")
+
+    except asyncio.CancelledError:
+        logger.info(f"Request cancelled for run_id: {run_id}")
+        result = {"status": "cancelled", "run_id": run_id, "message": "Execution was cancelled"}
+        return result
+
+    except Exception as e:
+        # 使用错误分类器获取错误信息
+        error_response = service.error_classifier.get_error_response(e, {"node_name": "http_run", "run_id": run_id})
+        logger.error(
+            f"Unexpected error in http_run: [{error_response['error_code']}] {error_response['error_message']}, "
+            f"traceback: {traceback.format_exc()}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": error_response["error_code"],
+                "error_message": error_response["error_message"],
+                "stack_trace": extract_core_stack(),
+            }
+        )
+    finally:
+        cozeloop.flush()
+
+
+HEADER_X_WORKFLOW_STREAM_MODE = "x-workflow-stream-mode"
+
+
+def _register_task(run_id: str, task: asyncio.Task):
+    service.running_tasks[run_id] = task
+
+
+@app.post("/stream_run")
+async def http_stream_run(request: Request):
+    ctx = new_context(method="stream_run", headers=request.headers)
+    # 优先使用上游指定的 run_id，保证 cancel 能精确匹配
+    upstream_run_id = request.headers.get(HEADER_X_RUN_ID)
+    if upstream_run_id:
+        ctx.run_id = upstream_run_id
+    workflow_stream_mode = request.headers.get(HEADER_X_WORKFLOW_STREAM_MODE, "").lower()
+    workflow_debug = workflow_stream_mode == "debug"
+    request_context.set(ctx)
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except Exception as e:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid JSON format: {body_text}, traceback: {extract_core_stack()}, error: {e}")
+    run_id = ctx.run_id
+    is_agent = graph_helper.is_agent_proj()
+    logger.info(
+        f"Received request for /stream_run: "
+        f"run_id={run_id}, "
+        f"is_agent_project={is_agent}, "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}"
+    )
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_stream_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format:{extract_core_stack()}")
+
+    if is_agent:
+        stream_generator = agent_stream_handler(
+            payload=payload,
+            ctx=ctx,
+            run_id=run_id,
+            stream_sse_func=service.stream_sse,
+            sse_event_func=service._sse_event,
+            error_classifier=service.error_classifier,
+            register_task_func=_register_task,
+        )
+    else:
+        stream_generator = workflow_stream_handler(
+            payload=payload,
+            ctx=ctx,
+            run_id=run_id,
+            stream_sse_func=service.stream_sse,
+            sse_event_func=service._sse_event,
+            error_classifier=service.error_classifier,
+            register_task_func=_register_task,
+            run_opt=RunOpt(workflow_debug=workflow_debug),
+        )
+
+    response = StreamingResponse(stream_generator, media_type="text/event-stream")
+    return response
+
+@app.post("/cancel/{run_id}")
+async def http_cancel(run_id: str, request: Request):
+    """
+    取消指定run_id的执行
+
+    使用asyncio.Task.cancel()实现取消,这是Python标准的异步任务取消机制。
+    LangGraph会在节点之间的await点检查CancelledError,实现优雅取消。
+    """
+    ctx = new_context(method="cancel", headers=request.headers)
+    request_context.set(ctx)
+    logger.info(f"Received cancel request for run_id: {run_id}")
+    result = service.cancel_run(run_id, ctx)
+    return result
+
+
+@app.post(path="/node_run/{node_id}")
+async def http_node_run(node_id: str, request: Request):
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except UnicodeDecodeError:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format: {body_text}")
+    ctx = new_context(method="node_run", headers=request.headers)
+    request_context.set(ctx)
+    logger.info(
+        f"Received request for /node_run/{node_id}: "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}",
+    )
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_node_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format:{extract_core_stack()}")
+    try:
+        return await service.run_node(node_id, payload, ctx)
+    except KeyError:
+        raise HTTPException(status_code=404,
+                            detail=f"node_id '{node_id}' not found or input miss required fields, traceback: {extract_core_stack()}")
+    except Exception as e:
+        # 使用错误分类器获取错误信息
+        error_response = service.error_classifier.get_error_response(e, {"node_name": node_id})
+        logger.error(
+            f"Unexpected error in http_node_run: [{error_response['error_code']}] {error_response['error_message']}, "
+            f"traceback: {traceback.format_exc()}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": error_response["error_code"],
+                "error_message": error_response["error_message"],
+                "stack_trace": extract_core_stack(),
+            }
+        )
+    finally:
+        cozeloop.flush()
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI Chat Completions API 兼容接口"""
+    ctx = new_context(method="openai_chat", headers=request.headers)
+    request_context.set(ctx)
+
+    logger.info(f"Received request for /v1/chat/completions: run_id={ctx.run_id}")
+
+    try:
+        payload = await request.json()
+        return await openai_handler.handle(payload, ctx)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in openai_chat_completions: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+    finally:
+        cozeloop.flush()
+
+
+@app.get("/health")
+async def health_check():
+    try:
+        # 这里可以添加更多的健康检查逻辑
+        return {
+            "status": "ok",
+            "message": "Service is running",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get(path="/graph_parameter")
+async def http_graph_inout_parameter(request: Request):
+    return service.graph_inout_schema()
+
+# ============================================================
+# 电商智能助手路由 (挂载到主应用)
+# ============================================================
+import hashlib
+import io
+import uuid
+import pandas as pd
+from fastapi import UploadFile, File, Form
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from ecommerce.models import (
+    Base as EcomBase, User, SalesData, ReportFile,
+    Conversation, GeneratedImage, DashboardCache
+)
+
+# 请求模型
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+class AskRequest(BaseModel):
+    question: str
+    session_id: str = ""
+class CopywritingRequest(BaseModel):
+    product_name: str = "高腰显瘦牛仔裤"
+    style: str = "直筒"
+    scene: str = "抖音短视频"
+    target_audience: str = "年轻女性"
+    key_selling_points: str = "显瘦、高腰、百搭"
+    tone: str = "亲和"
+class ScriptRequest(BaseModel):
+    script_type: str = "种草"
+    product_name: str = "高腰显瘦牛仔裤"
+    duration: str = "30s"
+    target_audience: str = "年轻女性"
+class StrategyRequest(BaseModel):
+    focus: str = "综合"
+    period: str = "本月"
+class ImageGenRequest(BaseModel):
+    prompt: str
+    style: str = "写实"
+    size: str = "2K"
+class DataEditRequest(BaseModel):
+    id: int
+    field: str
+    value: Any
+class SessionHistoryRequest(BaseModel):
+    session_id: str
+    msg_type: str = ""
+
+# 静态文件路径
+EC_STATIC_DIR = os.path.join(os.getenv("COZE_WORKSPACE_PATH", "/workspace/projects"), "assets", "ecommerce")
+
+@app.on_event("startup")
+def create_ecommerce_tables():
+    """创建电商数据表"""
+    try:
+        engine = get_engine()
+        EcomBase.metadata.create_all(bind=engine)
+        logger.info("✅ 电商智能助手数据表创建完成")
+    except Exception as e:
+        logger.warning(f"电商表创建(可能已存在): {e}")
+
+def _ec_db():
+    return get_session()
+
+def _make_pwd(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def _call_llm(prompt: str, system_prompt: str = "", temperature: float = 0.7) -> str:
+    """调用大模型"""
+    from coze_coding_dev_sdk import LLMClient
+    from coze_coding_utils.runtime_ctx.context import new_context
+    from langchain_core.messages import SystemMessage, HumanMessage
+    ctx = new_context(method="ec_llm")
+    client = LLMClient(ctx=ctx)
+    messages = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(HumanMessage(content=prompt))
+    resp = client.invoke(messages=messages, model="doubao-seed-2-0-lite-260215", temperature=temperature, max_completion_tokens=8192)
+    if isinstance(resp.content, str):
+        return resp.content
+    elif isinstance(resp.content, list):
+        parts = []
+        for item in resp.content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return " ".join(parts)
+    return str(resp.content)
+
+def _parse_kv(ed, k):
+    """从 extra_data dict 提取数值，支持多个候选key"""
+    if not ed or not isinstance(ed, dict): return 0
+    for key in (k if isinstance(k, (list,tuple)) else [k]):
+        v = ed.get(key)
+        if v is not None:
+            try: return float(str(v).replace(",","").replace("¥","").replace("￥","").strip())
+            except: pass
+    return 0
+
+def _get_sales_summary(db, year=2025):
+    """获取完整销售数据摘要（含extra_data解析和主播维度）"""
+    rows = db.query(SalesData).filter(SalesData.data_year == year).all()
+    # 解析所有行
+    records = []
+    for r in rows:
+        ed = r.extra_data if isinstance(r.extra_data, dict) else {}
+        vol = _parse_kv(ed, ["利润-销售数量(扣退)","销售数量(扣退)","sales_volume"]) or (float(r.sales_volume or 0))
+        amt = _parse_kv(ed, ["利润-销售金额(扣退)","销售金额(扣退)","sales_amount"]) or (float(r.sales_amount or 0))
+        profit = _parse_kv(ed, ["利润-毛利额","毛利额","profit"]) or (float(r.profit or 0))
+        ship_qty = _parse_kv(ed, ["商品数据-实发数量","实发数量"])
+        ship_amt = _parse_kv(ed, ["商品数据-实发金额","实发金额"])
+        zhubo = (ed.get("主播") or "").strip()
+        sku = (ed.get("商品编码") or r.sku_code or "").strip()
+        pname = (ed.get("商品简称") or r.product_name or "").strip()
+        cat = (ed.get("分类") or r.category or "").strip()
+        month = r.data_month or 0
+        records.append({"month":month,"zhubo":zhubo,"sku":sku,"pname":pname,"cat":cat,
+                        "vol":vol,"amt":amt,"profit":profit,"ship_qty":ship_qty,"ship_amt":ship_amt})
+    # 汇总
+    total_vol = sum(r["vol"] for r in records)
+    total_amt = sum(r["amt"] for r in records)
+    total_profit = sum(r["profit"] for r in records)
+    total_ship = sum(r["ship_qty"] for r in records)
+    # 月度
+    from collections import defaultdict
+    mdata = defaultdict(lambda: {"vol":0,"amt":0,"profit":0})
+    for r in records:
+        m = r["month"]
+        mdata[m]["vol"] += r["vol"]
+        mdata[m]["amt"] += r["amt"]
+        mdata[m]["profit"] += r["profit"]
+    # 主播汇总
+    zdata = defaultdict(lambda: {"vol":0,"amt":0,"profit":0,"ship":0,"ship_amt":0})
+    for r in records:
+        z = r["zhubo"]
+        if z and z.lower() != "nan":
+            zdata[z]["vol"] += r["vol"]
+            zdata[z]["amt"] += r["amt"]
+            zdata[z]["profit"] += r["profit"]
+            zdata[z]["ship"] += r["ship_qty"]
+            zdata[z]["ship_amt"] += r["ship_amt"]
+    top_zhubo = sorted(zdata.items(), key=lambda x: -x[1]["vol"])[:20]
+    # 各月主播汇总
+    zmdata = defaultdict(lambda: defaultdict(lambda: {"vol": 0, "amt": 0, "profit": 0}))
+    for r in records:
+        m, z = r["month"], r["zhubo"]
+        if z and z.lower() != "nan":
+            zmdata[m][z]["vol"] += r["vol"]
+            zmdata[m][z]["amt"] += r["amt"]
+            zmdata[m][z]["profit"] += r["profit"]
+    # SKU汇总
+    sdata = defaultdict(lambda: {"vol":0,"amt":0,"profit":0,"pname":""})
+    for r in records:
+        k = r["sku"]
+        if k:
+            sdata[k]["vol"] += r["vol"]
+            sdata[k]["amt"] += r["amt"]
+            sdata[k]["profit"] += r["profit"]
+            sdata[k]["pname"] = r["pname"] or sdata[k]["pname"]
+    top_sku = sorted(sdata.items(), key=lambda x: -x[1]["vol"])[:20]
+    # 分类汇总
+    cdata = defaultdict(lambda: {"vol":0,"amt":0})
+    for r in records:
+        c = r["cat"]
+        if c:
+            cdata[c]["vol"] += r["vol"]
+            cdata[c]["amt"] += r["amt"]
+    # 构建文本
+    lines = [f"=== {year}年 女装牛仔裤销售数据总览 ==="]
+    lines.append(f"总扣退后销量: {total_vol:,.0f}")
+    lines.append(f"总扣退后销售额: ¥{total_amt:,.2f}")
+    lines.append(f"总毛利额: ¥{total_profit:,.2f}")
+    lines.append(f"总实发数量: {total_ship:,.0f}")
+    lines.append(f"参与主播数: {len(zdata)}")
+    lines.append(f"SKU品类数: {len(cdata)}")
+    lines.append("")
+    lines.append("=== 月度销售数据 ===")
+    for m in sorted(mdata.keys()):
+        d = mdata[m]
+        lines.append(f"  {year}年{m}月 - 扣退后销量:{d['vol']:,.0f}, 销售额:¥{d['amt']:,.2f}, 毛利额:¥{d['profit']:,.2f}")
+    lines.append("")
+    lines.append("")
+    lines.append("=== 各月主播数据 ===")
+    months = sorted(zmdata.keys())
+    if len(months) >= 2:
+        m1, m2 = months[0], months[1]
+        m1_zhubos = {z: d for z, d in sorted(zmdata[m1].items(), key=lambda x: -x[1]["vol"])}
+        m2_zhubos = {z: d for z, d in sorted(zmdata[m2].items(), key=lambda x: -x[1]["vol"])}
+        all_names = set(list(m1_zhubos.keys())[:15] + list(m2_zhubos.keys())[:15])
+        lines.append(f"对比月份: {m1}月 vs {m2}月")
+        for z in sorted(all_names, key=lambda x: -(m2_zhubos.get(x,{})|m1_zhubos.get(x,{})).get("vol",0)):
+            d1 = m1_zhubos.get(z, {"vol":0,"amt":0})
+            d2 = m2_zhubos.get(z, {"vol":0,"amt":0})
+            v1 = f"{d1['vol']:,.0f}" if d1["vol"] > 0 else "0"
+            a1 = f"¥{d1['amt']:,.2f}" if d1["amt"] > 0 else "¥0"
+            v2 = f"{d2['vol']:,.0f}" if d2["vol"] > 0 else "0"
+            a2 = f"¥{d2['amt']:,.2f}" if d2["amt"] > 0 else "¥0"
+            if d1["vol"] > 0 and d2["vol"] > 0:
+                pct = f"+{(d2['vol']/d1['vol']-1)*100:.0f}%" if d2['vol'] > d1['vol'] else f"-{(1-d2['vol']/d1['vol'])*100:.0f}%"
+            elif d1["vol"] == 0 and d2["vol"] > 0:
+                pct = "新上榜"
+            elif d1["vol"] > 0 and d2["vol"] == 0:
+                pct = "跌出TOP10"
+            else:
+                pct = "—"
+            lines.append(f"  {z[:30]}: {m1}月-销量{v1} 销售额{a1} | {m2}月-销量{v2} 销售额{a2} | 变化:{pct}")
+    else:
+        for m in months:
+            lines.append(f"  {year}年{m}月 TOP主播:")
+            top_mz = sorted(zmdata[m].items(), key=lambda x: -x[1]["vol"])[:10]
+            for i, (z, d) in enumerate(top_mz):
+                lines.append(f"    {i+1}. {z[:20]} - 销量:{d['vol']:,.0f}, 销售额:¥{d['amt']:,.2f}")
+    lines.append("")
+    lines.append("=== 分类销量排行 ===")
+    for i,(c,d) in enumerate(sorted(cdata.items(), key=lambda x:-x[1]["vol"])):
+        lines.append(f"  {i+1}. {c} - 销量:{d['vol']:,.0f}, 销售额:¥{d['amt']:,.2f}")
+    lines.append("")
+    lines.append("=== TOP 20 主播排行（按扣退后销量）===")
+    for i,(z,d) in enumerate(top_zhubo):
+        lines.append(f"  {i+1}. {z} - 销量:{d['vol']:,.0f}, 销售额:¥{d['amt']:,.2f}, 毛利:¥{d['profit']:,.2f}")
+    lines.append("")
+    lines.append("=== TOP 20 SKU销量排行 ===")
+    for i,(k,d) in enumerate(top_sku):
+        lines.append(f"  {i+1}. [{k}] {d['pname']} - 销量:{d['vol']:,.0f}, 销售额:¥{d['amt']:,.2f}")
+    return "\n".join(lines)
+
+def _get_zhubo_markdown_table(db, target_month=None, top_n=10):
+    """生成主播对比/排行Markdown表格
+    - target_month=None: 对比最近两个月TOP N
+    - target_month=3: 仅显示该月销量TOP N
+    """
+    sales = db.query(SalesData)
+    total = sales.count()
+    if total == 0: return ""
+    year = sales.first().data_year
+
+    rows = sales.filter(SalesData.data_year == year).all()
+    zmdata = {}
+    for r in rows:
+        ed = r.extra_data if isinstance(r.extra_data, dict) else {}
+        zname = (ed.get("主播") or "").strip()
+        if not zname or zname.lower() == "nan": continue
+        m = r.data_month
+        vol = _parse_kv(ed, ["利润-销售数量(扣退)","销售数量(扣退)","sales_volume"]) or (float(r.sales_volume or 0))
+        amt = _parse_kv(ed, ["利润-销售金额(扣退)","销售金额(扣退)","sales_amount"]) or (float(r.sales_amount or 0))
+        if vol == 0 and amt == 0: continue
+        zmdata.setdefault(m, {}).setdefault(zname, {"vol":0,"amt":0})
+        zmdata[m][zname]["vol"] += vol
+        zmdata[m][zname]["amt"] += amt
+
+    # 指定月份 → 仅展示该月TOP N按销量排序
+    if target_month and target_month in zmdata:
+        zhubos = zmdata[target_month]
+        sorted_zhubos = sorted(zhubos.items(), key=lambda x: -x[1]["vol"])
+        top = sorted_zhubos[:top_n]
+        lines = [""]
+        lines.append(f"| 主播名称 | {target_month}月销量 | {target_month}月销售额 |")
+        lines.append("| --- | --- | --- |")
+        for z, d in top:
+            v = f"{d['vol']:,.0f}" if d['vol'] > 0 else "—"
+            a = f"¥{d['amt']:,.2f}" if d['amt'] > 0 else "—"
+            lines.append(f"| {z} | {v} | {a} |")
+        return "\n".join(lines)
+
+    # 无指定月份 → 对比最近两个月
+    months = sorted(zmdata.keys())
+    if len(months) < 2: return ""
+
+    m1, m2 = months[0], months[1]
+    m1_zhubos = {z: d for z, d in sorted(zmdata[m1].items(), key=lambda x: -x[1]["vol"])}
+    m2_zhubos = {z: d for z, d in sorted(zmdata[m2].items(), key=lambda x: -x[1]["vol"])}
+    all_names = set(list(m1_zhubos.keys())[:top_n*2] + list(m2_zhubos.keys())[:top_n*2])
+
+    lines = [""]
+    lines.append(f"| 主播名称 | {m1}月销量 | {m1}月销售额 | {m2}月销量 | {m2}月销售额 | 变化 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for z in sorted(all_names, key=lambda x: -(m2_zhubos.get(x,{})|m1_zhubos.get(x,{})).get("vol",0)):
+        d1 = m1_zhubos.get(z, {"vol":0,"amt":0})
+        d2 = m2_zhubos.get(z, {"vol":0,"amt":0})
+        v1 = f"{d1['vol']:,.0f}" if d1["vol"] > 0 else "—"
+        a1 = f"¥{d1['amt']:,.2f}" if d1["amt"] > 0 else "—"
+        v2 = f"{d2['vol']:,.0f}" if d2["vol"] > 0 else "—"
+        a2 = f"¥{d2['amt']:,.2f}" if d2["amt"] > 0 else "—"
+        if d1["vol"] > 0 and d2["vol"] > 0:
+            pct = f"+{(d2['vol']/d1['vol']-1)*100:.0f}%" if d2['vol'] > d1['vol'] else f"-{(1-d2['vol']/d1['vol'])*100:.0f}%"
+        elif d1["vol"] == 0 and d2["vol"] > 0:
+            pct = "新上榜"
+        elif d1["vol"] > 0 and d2["vol"] == 0:
+            pct = "跌出TOP10"
+        else:
+            pct = "—"
+        lines.append(f"| {z} | {v1} | {a1} | {v2} | {a2} | {pct} |")
+    return "\n".join(lines)
+
+# ----- 认证 -----
+@app.post("/api/login")
+async def ec_login(req: LoginRequest):
+    db = _ec_db()
+    try:
+        user = db.query(User).filter(User.username == req.username).first()
+        if not user:
+            user = User(username=req.username, password_hash=_make_pwd(req.password), display_name=req.username)
+            db.add(user); db.commit(); db.refresh(user)
+            return {"success": True, "user_id": user.id, "username": user.username, "display_name": user.display_name, "is_new": True}
+        if user.password_hash != _make_pwd(req.password):
+            raise HTTPException(status_code=401, detail="密码错误")
+        return {"success": True, "user_id": user.id, "username": user.username, "display_name": user.display_name}
+    finally:
+        db.close()
+
+# ----- 数据上传 -----
+@app.post("/api/data/upload")
+async def ec_upload(file: UploadFile = File(...), data_year: int = Form(2025), data_month: int = Form(0)):
+    db = _ec_db()
+    try:
+        content = await file.read()
+        fn = file.filename.lower()
+        # === 从文件名提取月份（如"3月.csv" → 3）===
+        import re
+        m = re.search(r'(\d+)\s*月', file.filename)
+        if m:
+            file_month = int(m.group(1))
+            if file_month < 1 or file_month > 12:
+                file_month = data_month or 1
+        else:
+            file_month = data_month or 1
+        # === END ===
+        if fn.endswith(".csv"):
+            # 尝试多种编码解析中文CSV文件
+            _encodings = ["utf-8", "gbk", "gb2312", "gb18030", "latin-1", "iso-8859-1"]
+            df = None
+            for _enc in _encodings:
+                try:
+                    df = pd.read_csv(io.BytesIO(content), encoding=_enc)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            if df is None:
+                df = pd.read_csv(io.BytesIO(content), encoding="utf-8", errors="replace")
+        elif fn.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(content))
+        else:
+            raise HTTPException(status_code=400, detail="仅支持 CSV/Excel")
+        df.columns = [c.strip().lower() for c in df.columns]
+        cm = {"sku编码":"sku_code","sku_code":"sku_code","商品名称":"product_name","product_name":"product_name","类目":"category","版型":"style","颜色":"color","尺码":"size","销量":"sales_volume","sales_volume":"sales_volume","销售额":"sales_amount","成本":"cost","利润":"profit","利润率":"profit_margin","退货数":"return_count","退货率":"return_rate","库存":"inventory"}
+        df.rename(columns=cm, inplace=True)
+        # 统一用文件名中的月份覆盖整表
+        df["data_month"] = file_month
+        row_count = 0
+        for _, row in df.iterrows():
+            try:
+                r = SalesData(report_name=file.filename, data_year=data_year, data_month=file_month, sku_code=str(row.get("sku_code",""))[:100], product_name=str(row.get("product_name",""))[:300], category=str(row.get("category",""))[:100], style=str(row.get("style",""))[:100], color=str(row.get("color",""))[:50], size=str(row.get("size",""))[:50], sales_volume=int(float(row.get("sales_volume",0))), sales_amount=float(row.get("sales_amount",0)), cost=float(row.get("cost",0)), profit=float(row.get("profit",0)), profit_margin=float(row.get("profit_margin",0)), return_count=int(float(row.get("return_count",0))), return_rate=float(row.get("return_rate",0)), inventory=int(float(row.get("inventory",0))))
+                if r.profit == 0 and r.sales_amount > 0: r.profit = r.sales_amount - r.cost
+                if r.profit_margin == 0 and r.profit > 0 and r.sales_amount > 0: r.profit_margin = r.profit / r.sales_amount
+                db.add(r); row_count += 1
+            except Exception as e:
+                logger.warning(f"跳过异常: {e}")
+        db.add(ReportFile(file_name=file.filename, file_size=len(content), file_type="csv" if fn.endswith(".csv") else "excel", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=row_count))
+        db.commit()
+        return {"success": True, "message": f"成功导入 {row_count} 条", "file_name": file.filename, "row_count": row_count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback(); logger.exception("上传失败"); raise HTTPException(status_code=500, detail=f"处理失败: {e}")
+    finally:
+        db.close()
+
+# ----- 数据列表（按文件）-----
+@app.get("/api/data/files")
+async def ec_data_files(year: int = Query(2025)):
+    db = _ec_db()
+    try:
+        files = db.query(ReportFile).filter(ReportFile.data_year == year).order_by(ReportFile.created_at.desc()).all()
+        return {"success": True, "files": [{"id":f.id,"file_name":f.file_name,"file_size":f.file_size,"file_type":f.file_type,"data_year":f.data_year,"report_period":f.report_period,"row_count":f.row_count,"status":f.status,"created_at":f.created_at.isoformat() if f.created_at else ""} for f in files]}
+    finally:
+        db.close()
+
+@app.get("/api/data/list")
+async def ec_data_list(year: int = Query(2025), month: int = Query(0), report_name: str = Query(""), page: int = Query(1), page_size: int = Query(50)):
+    db = _ec_db()
+    try:
+        q = db.query(SalesData).filter(SalesData.data_year == year)
+        if month > 0: q = q.filter(SalesData.data_month == month)
+        if report_name: q = q.filter(SalesData.report_name == report_name)
+        total = q.count()
+        items = q.order_by(SalesData.data_month.desc(), SalesData.sales_volume.desc()).offset((page-1)*page_size).limit(page_size).all()
+        result = [{"id":i.id,"report_name":i.report_name,"data_year":i.data_year,"data_month":i.data_month,"data_quarter":(i.data_month-1)//3+1,"sku_code":i.sku_code,"product_name":i.product_name,"category":i.category,"style":i.style,"color":i.color,"size":i.size,"sales_volume":i.sales_volume,"sales_amount":float(i.sales_amount),"cost":float(i.cost),"profit":float(i.profit),"profit_margin":float(i.profit_margin),"return_count":i.return_count,"return_rate":float(i.return_rate),"inventory":i.inventory} for i in items]
+        return {"success": True, "total": total, "items": result, "page": page, "page_size": page_size}
+    finally:
+        db.close()
+
+@app.delete("/api/data/{data_id}")
+async def ec_data_delete(data_id: int):
+    db = _ec_db()
+    try:
+        item = db.query(SalesData).filter(SalesData.id == data_id).first()
+        if not item: raise HTTPException(status_code=404, detail="不存在")
+        db.delete(item); db.commit()
+        return {"success": True, "message": "已删除"}
+    finally:
+        db.close()
+
+@app.delete("/api/data/file/{file_name:path}")
+async def ec_data_file_delete(file_name: str):
+    db = _ec_db()
+    try:
+        # 删除文件记录
+        files = db.query(ReportFile).filter(ReportFile.file_name == file_name).all()
+        for f in files: db.delete(f)
+        # 删除该文件导入的所有数据
+        rows = db.query(SalesData).filter(SalesData.report_name == file_name).all()
+        for r in rows: db.delete(r)
+        db.commit()
+        return {"success": True, "message": f"已删除文件 {file_name}，共移除 {len(rows)} 条数据"}
+    finally:
+        db.close()
+
+# ----- 电商问答 -----
+def _parse_question_month(q: str):
+    """从问题中解析出目标月份
+    - 返回 (target_month, is_comparison)
+    - target_month=None 表示不限定单月
+    - is_comparison=True 表示需要对比
+    """
+    import re
+    months = re.findall(r'(\d+)\s*月', q)
+    if not months:
+        return None, False
+    # 如果包含"对比"、"比较"、"vs" 或 提到两个不同月份 → 对比模式
+    has_compare = any(kw in q for kw in ["对比", "比较", "vs", "VS", "V.S"])
+    unique_months = list(set(int(m) for m in months))
+    if has_compare or len(unique_months) >= 2:
+        return None, True  # 对比模式
+    return unique_months[0], False  # 单月模式
+
+@app.post("/api/ask")
+async def ec_ask(req: AskRequest):
+    db = _ec_db()
+    try:
+        summary = _get_sales_summary(db)
+        # 解析问题中的月份，决定表格类型
+        target_month, is_compare = _parse_question_month(req.question)
+        zhubo_table = _get_zhubo_markdown_table(db, target_month=target_month, top_n=10)
+        sp = """# 角色
+你是女装牛仔裤电商数据智能助手，精通数据分析、趋势解读。
+
+# 规则
+1. 所有回答基于下方"数据摘要"
+2. 数据不足时明确告知
+3. 结构化回答：结论→分析→建议，各部分之间用简短标题+内容，不使用过多空行
+4. 金额标注¥
+5. 格式整洁：段与段之间最多1个空行，不使用多个连续空行
+6. **重要：不要在你的回答中生成任何表格！** 主播对比表会单独展示在你的回答上方，你只需要写分析解读文字（结论→分析→建议）。
+7. 如果涉及主播，遇到值为"nan"或空的主播名请自动忽略，不要出现在回答中
+8. 用户指定了月份（如"3月份"）时，只分析该月数据即可，不要对比其他月份
+9. 用户要求对比时再进行双月对比分析"""
+        prompt = f"\n\n【数据摘要】\n{summary}\n\n【问题】\n{req.question}"
+        answer = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.3)
+        if req.session_id:
+            db.add(Conversation(session_id=req.session_id, role="user", content=req.question[:2000], msg_type="chat"))
+            db.add(Conversation(session_id=req.session_id, role="assistant", content=answer[:5000], msg_type="chat"))
+            db.commit()
+        return {"success": True, "answer": answer, "table": zhubo_table}
+    except Exception as e:
+        logger.exception("问答失败"); raise HTTPException(status_code=500, detail=f"问答失败: {e}")
+    finally:
+        db.close()
+
+# ----- 运营文案 -----
+@app.post("/api/copywriting")
+async def ec_copywriting(req: CopywritingRequest):
+    sp = """你是抖音女装牛仔裤顶级文案专家。你的文案风格：
+- 超级口语化，像闺蜜聊天
+- 每句话都有画面感，让用户"看到"自己穿上后的样子
+- 精准戳中微胖/腿不直/胯宽/梨形身材女生的痛点
+- 不喊口号，用细节说话
+
+输出必须严格按以下格式，不要使用 Markdown 标记（不要用 # * - --- 等符号）：
+
+【3个抖音标题】
+① 标题一
+② 标题二
+③ 标题三
+
+【3条FAB文案】
+
+文案1（针对具体人群）
+Feature（特性）：产品具体特性
+Advantage（优势）：这个特性带来的好处
+Benefit（利益）：用户穿上后的体感和效果
+
+文案2（针对具体人群）
+Feature（特性）：产品具体特性
+Advantage（优势）：这个特性带来的好处
+Benefit（利益）：用户穿上后的体感和效果
+
+文案3（针对具体场景）
+Feature（特性）：产品具体特性
+Advantage（优势）：这个特性带来的好处
+Benefit（利益）：用户穿上后的体感和效果
+
+【完整口播】
+写一段完整的口播文案"""
+    prompt = f"""商品：{req.product_name}
+版型：{req.style}
+场景：{req.scene}
+卖点：{req.key_selling_points}
+风格：{req.tone}
+人群：{req.target_audience}
+
+请严格按照要求的格式输出。"""
+    content = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.8)
+    return {"success": True, "content": content}
+
+@app.post("/api/script")
+async def ec_script(req: ScriptRequest):
+    sp = "你是抖音女装牛仔裤视频脚本专家。输出分镜：时长/画面/台词/BGM/字幕。标注完播率/互动/转化节点。"
+    prompt = f"生成{req.script_type}脚本\n商品：{req.product_name}\n时长：{req.duration}"
+    content = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.8)
+    return {"success": True, "content": content}
+
+@app.post("/api/hot-topics")
+async def ec_hot_topics():
+    sp = "你是抖音女装牛仔裤内容策略分析师。禁止使用#、---、*等Markdown标记，全部用纯文字+序号展示。"
+    prompt = "分析当前抖音女装牛仔裤，按以下结构用纯文字+序号输出：一、当前热门方向（场景化细分/功能痛点/内容形式）二、用户偏好（版型/身材适配/风格）三、季节性趋势 四、机会点。禁止使用#、---、*等任何Markdown符号"
+    content = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.7)
+    return {"success": True, "content": content}
+
+@app.post("/api/strategy")
+async def ec_strategy(req: StrategyRequest):
+    db = _ec_db()
+    try:
+        summary = _get_sales_summary(db)
+        sp = "你是女装牛仔裤电商运营策略顾问。基于数据给建议，要求具体可执行。"
+        prompt = f"基于以下数据给{req.period}策略建议:\n{summary}\n\n分析:1)数据总览 2)主推款 3)定价 4)活动 5)预警"
+        content = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.5)
+        return {"success": True, "content": content}
+    finally:
+        db.close()
+
+# ----- AI生图 -----
+@app.post("/api/generate-image")
+async def ec_gen_image(req: ImageGenRequest):
+    try:
+        from coze_coding_dev_sdk import ImageGenerationClient
+        from coze_coding_utils.runtime_ctx.context import new_context as new_ctx
+        ctx = new_ctx(method="ec_img")
+        client = ImageGenerationClient(ctx=ctx)
+        prompt = f"女装牛仔裤, {req.style}风格, {req.prompt}, 高质量商品展示, 商业摄影"
+        resp = client.generate(prompt=prompt, size=req.size, model="doubao-seedream-5-0-260128")
+        if resp.success and resp.image_urls:
+            urls = resp.image_urls
+            db = _ec_db()
+            try:
+                for url in urls:
+                    db.add(GeneratedImage(prompt=req.prompt, image_url=url, style=req.style, size=req.size))
+                db.commit()
+            except Exception as e:
+                logger.warning(f"保存记录失败: {e}")
+            finally:
+                db.close()
+            return {"success": True, "image_urls": urls, "prompt": req.prompt}
+        else:
+            raise HTTPException(status_code=500, detail=f"生图失败: {resp.error_messages}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("生图失败"); raise HTTPException(status_code=500, detail=f"失败: {e}")
+
+@app.get("/api/image-history")
+async def ec_img_history(page: int = Query(1), page_size: int = Query(20)):
+    db = _ec_db()
+    try:
+        items = db.query(GeneratedImage).order_by(GeneratedImage.created_at.desc()).offset((page-1)*page_size).limit(page_size).all()
+        total = db.query(GeneratedImage).count()
+        return {"success": True, "items": [{"id":i.id,"prompt":i.prompt,"image_url":i.image_url,"style":i.style,"size":i.size,"created_at":i.created_at.isoformat() if i.created_at else ""} for i in items], "total": total, "page": page}
+    finally:
+        db.close()
+
+# ----- 对话 -----
+@app.post("/api/conversations")
+async def ec_conversations(req: SessionHistoryRequest):
+    db = _ec_db()
+    try:
+        q = db.query(Conversation).filter(Conversation.session_id == req.session_id)
+        if req.msg_type: q = q.filter(Conversation.msg_type == req.msg_type)
+        items = q.order_by(Conversation.created_at).all()
+        return {"success": True, "items": [{"id":i.id,"role":i.role,"content":i.content,"msg_type":i.msg_type,"created_at":i.created_at.isoformat() if i.created_at else ""} for i in items], "session_id": req.session_id}
+    finally:
+        db.close()
+
+@app.get("/api/conversations/sessions")
+async def ec_sessions(page: int = Query(1), page_size: int = Query(20)):
+    db = _ec_db()
+    try:
+        subq = db.query(Conversation.session_id, func.max(Conversation.created_at).label("last_time"), func.min(Conversation.created_at).label("first_time")).group_by(Conversation.session_id).subquery()
+        total = db.query(subq).count()
+        sessions = db.query(subq).order_by(subq.c.last_time.desc()).offset((page-1)*page_size).limit(page_size).all()
+        result = []
+        for s in sessions:
+            first = db.query(Conversation).filter(Conversation.session_id == s.session_id, Conversation.role == "user").order_by(Conversation.created_at).first()
+            cnt = db.query(Conversation).filter(Conversation.session_id == s.session_id).count()
+            result.append({"session_id": s.session_id, "title": (first.content[:80]+"...") if first and len(first.content)>80 else (first.content if first else "新对话"), "message_count": cnt, "created_at": s.first_time.isoformat() if s.first_time else "", "last_time": s.last_time.isoformat() if s.last_time else ""})
+        return {"success": True, "items": result, "total": total, "page": page}
+    finally:
+        db.close()
+
+# ----- 看板 -----
+@app.get("/api/dashboard")
+async def ec_dashboard(year: int = Query(2025), month: int = Query(0), file_name: str = Query("")):
+    db = _ec_db()
+    try:
+        base_q = db.query(SalesData).filter(SalesData.data_year == year)
+        if month > 0:
+            base_q = base_q.filter(SalesData.data_month == month)
+        if file_name:
+            base_q = base_q.filter(SalesData.report_name == file_name)
+        rows = base_q.all()
+        if not rows:
+            return {"success": True, "year": year, "month": month, "overview": {"koutui_vol":0,"koutui_amt":0,"ship_qty":0,"ship_amt":0,"profit":0,"profit_rate":0,"refund_qty":0,"refund_rate":0,"sku_count":0,"zhubo_count":0}, "monthly_trend": [], "top_zhubo": [], "top_sku": [], "files": []}
+        total_kv, total_ka, total_sq, total_sa, total_p, total_rq = 0,0,0,0,0,0
+        sku_set, zhubo_map, sku_map, monthly_agg = set(), {}, {}, {}
+        for r in rows:
+            ed = r.extra_data if isinstance(r.extra_data, dict) else {}
+            def ev(*ks, d=0.0):
+                for k in ks:
+                    v = ed.get(k)
+                    if v is not None and v != "" and str(v).lower() != "nan":
+                        try: return float(v)
+                        except: pass
+                return float(d) if d else 0.0
+            def es(*ks, d=""):
+                for k in ks:
+                    v = ed.get(k)
+                    if v is not None and v != "" and str(v).lower() != "nan": return str(v).strip()
+                return d
+            sku = (r.sku_code or "").strip() or es("商品编码","商品编号","sku编码","SKU")
+            pname = es("商品简称","商品名称","商品名") or (r.product_name or "").strip()
+            if sku: sku_set.add(sku)
+            kv = ev("利润-销售数量(扣退)","利润-销售数量（扣退）","扣退数量", d=float(r.sales_volume or 0))
+            ka = ev("利润-销售金额(扣退)","利润-销售金额（扣退）","扣退金额", d=float(r.sales_amount or 0))
+            sq = ev("商品数据-实发数量","商品数据-实发数量（含企业定制）","实发数量", d=float(r.sales_volume or 0))
+            sa = ev("商品数据-实发金额","商品数据-实发金额（含企业定制）","实发金额", d=float(r.sales_amount or 0))
+            p = ev("利润-毛利额","利润-毛利额（含企业定制）","毛利","利润", d=float(r.profit or 0))
+            rq = ev("利润-退款数量","退款数量","退货数", d=float(r.return_count or 0))
+            total_kv += kv; total_ka += ka; total_sq += sq; total_sa += sa; total_p += p; total_rq += rq
+            if sku:
+                if sku not in sku_map: sku_map[sku] = {"n":r.product_name or sku,"v":0,"a":0,"p":0}
+                sku_map[sku]["v"] += kv; sku_map[sku]["a"] += ka; sku_map[sku]["p"] += p
+            zb = es("主播","主播名字","主播名称")
+            if zb and zb.lower() != "nan":
+                if zb not in zhubo_map: zhubo_map[zb] = {"v":0,"a":0,"sq":0,"sa":0,"p":0}
+                zhubo_map[zb]["v"] += kv; zhubo_map[zb]["a"] += ka; zhubo_map[zb]["sq"] += sq; zhubo_map[zb]["sa"] += sa; zhubo_map[zb]["p"] += p
+            m = r.data_month or 1
+            if m not in monthly_agg: monthly_agg[m] = {"sales_volume":0,"sales_amount":0,"profit":0}
+            monthly_agg[m]["sales_volume"] += kv; monthly_agg[m]["sales_amount"] += ka; monthly_agg[m]["profit"] += p
+        pr = round(total_p/total_ka*100,2) if total_ka > 0 else 0
+        rr = round(total_rq/(total_kv+total_rq)*100,2) if total_kv+total_rq>0 else 0
+        tz = sorted(zhubo_map.items(), key=lambda x:x[1]["v"], reverse=True)[:100]
+        ts = sorted(sku_map.items(), key=lambda x:x[1]["v"], reverse=True)[:10]
+        files_q = db.query(ReportFile).filter(ReportFile.data_year == year)
+        if month > 0: files_q = files_q.filter(ReportFile.report_period.like(f"{year}-{month:02d}%"))
+        return {"success": True, "year": year, "month": month, "overview": {"koutui_vol":int(total_kv),"koutui_amt":round(total_ka,2),"ship_qty":int(total_sq),"ship_amt":round(total_sa,2),"profit":round(total_p,2),"profit_rate":pr,"refund_qty":int(total_rq),"refund_rate":rr,"sku_count":len(sku_set),"zhubo_count":len(zhubo_map)}, "monthly_trend": [{"month":m,**v} for m,v in sorted(monthly_agg.items())], "top_zhubo": [{"zhubo":z[0],"vol":z[1]["v"],"amt":z[1]["a"],"ship_qty":z[1]["sq"],"ship_amt":z[1]["sa"],"profit":z[1]["p"]} for z in tz], "top_sku": [{"product_code":s[0],"product_name":s[1]["n"],"vol":s[1]["v"],"amt":s[1]["a"],"profit":s[1]["p"]} for s in ts], "files": [{"file_name":f.file_name,"row_count":f.row_count} for f in files_q.all()]}
+    finally:
+        db.close()
+
+# ----- 首页 -----
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def ec_index():
+    idx = os.path.join(EC_STATIC_DIR, "index.html")
+    if os.path.exists(idx):
+        with open(idx, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>女装牛仔裤电商智能助手</h1><p>正在加载...</p>"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Start FastAPI server")
+    parser.add_argument("-m", type=str, choices=["http", "flow", "node", "agent"], default="http", help="运行模式")
+    parser.add_argument("-p", type=int, default=5000, help="HTTP服务端口")
+    parser.add_argument("-n", type=str, default=None, help="节点名称")
+    parser.add_argument("-i", type=str, default=None, help="输入数据")
+    return parser.parse_args()
+
+
+def parse_input(input_str: str) -> Dict[str, Any]:
+    """Parse input string, support both JSON string and plain text"""
+    if not input_str:
+        return {"text": "你好"}
+
+    # Try to parse as JSON first
+    try:
+        return json.loads(input_str)
+    except json.JSONDecodeError:
+        # If not valid JSON, treat as plain text
+        return {"text": input_str}
+
+def start_http_server(port):
+    workers = 1
+    reload = False
+    if graph_helper.is_dev_env():
+        reload = True
+
+    logger.info(f"Start HTTP Server, Port: {port}, Workers: {workers}")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload, workers=workers)
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.m == "http":
+        start_http_server(args.p)
+    elif args.m == "flow":
+        payload = parse_input(args.i)
+        result = asyncio.run(service.run(payload))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.m == "node" and args.n:
+        payload = parse_input(args.i)
+        result = asyncio.run(service.run_node(args.n, payload))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.m == "agent":
+        agent_ctx = new_context(method="agent")
+        for chunk in service.stream(
+                {
+                    "type": "query",
+                    "session_id": "1",
+                    "message": "你好",
+                    "content": {
+                        "query": {
+                            "prompt": [
+                                {
+                                    "type": "text",
+                                    "content": {"text": "现在几点了？请调用工具获取当前时间"},
+                                }
+                            ]
+                        }
+                    },
+                },
+                run_config={"configurable": {"session_id": "1"}},
+                ctx=agent_ctx,
+        ):
+            print(chunk)
