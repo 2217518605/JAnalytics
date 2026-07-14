@@ -10,29 +10,19 @@ MAX_RETRY_TIME = 20  # 连接最大重试时间（秒）
 # Load environment variables from .env if present
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # 从项目根目录加载 .env（用 abspath 确保绝对路径）
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".env")
+    _env_path = os.path.normpath(_env_path)
+    load_dotenv(dotenv_path=_env_path)
 except Exception:
     pass
 
 def get_db_url() -> str:
     """Build database URL from environment."""
     url = os.getenv("PGDATABASE_URL") or ""
-    if url is not None and url != "":
-        return url
-    from coze_workload_identity import Client
-    try:
-        client = Client()
-        env_vars = client.get_project_env_vars()
-        client.close()
-        for env_var in env_vars:
-            if env_var.key == "PGDATABASE_URL":
-                url = env_var.value.replace("'", "'\\''")
-                return url
-    except Exception as e:
-        logger.error(f"Error loading PGDATABASE_URL via coze_workload_identity: {e}")
-    finally:
-        if url is None or url == "":
-            logger.error("PGDATABASE_URL is not set")
+    if not url:
+        logger.error("PGDATABASE_URL is not set — please set it in .env or environment")
+        raise ValueError("PGDATABASE_URL is not set")
     return url
 _engine = None
 _SessionLocal = None

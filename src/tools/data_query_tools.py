@@ -1,22 +1,33 @@
-"""数据查询与分析工具 - 供 Agent 调用"""
+"""数据查询与分析工具 - 供 Agent 调用。核心分析委托给 ecommerce.analysis 模块。"""
 
 import os
 import json
 import re
+import warnings
 import chardet
 import pandas as pd
 from typing import Optional
 from langchain.tools import tool
-from coze_coding_utils.log.write_log import request_context
-from coze_coding_utils.runtime_ctx.context import new_context
 
-WORKSPACE_DIR = os.getenv("COZE_WORKSPACE_PATH", "/workspace/projects")
+warnings.filterwarnings("ignore", message=".*mixed types.*")
+
+from utils.paths import PROJECT_ROOT
+
+# 导入统一分析模块
+try:
+    from ecommerce.analysis import (
+        analyze_csv_text, analyze_csv_structured, analyze_comments_text,
+        get_uploaded_files, find_file_by_month, detect_columns, FIELD_MAP
+    )
+    _HAS_ANALYSIS_MODULE = True
+except ImportError:
+    _HAS_ANALYSIS_MODULE = False
 
 
 def _find_file(file_name: str) -> Optional[str]:
     """在 uploads 和 comments 目录查找文件"""
     for subdir in ("assets/uploads", "assets/comments"):
-        dir_path = os.path.join(WORKSPACE_DIR, subdir)
+        dir_path = os.path.join(PROJECT_ROOT, subdir)
         if not os.path.isdir(dir_path):
             continue
         for fn in os.listdir(dir_path):
@@ -57,15 +68,16 @@ def _read_file_to_df(fp: str) -> Optional[pd.DataFrame]:
 
 
 @tool
-def list_files(year: int = 0) -> str:
-    """获取已上传的文件列表，返回文件名称、行数、类型等信息。year=0 表示所有年份。"""
-    ctx = request_context.get() or new_context(method="list_files")
+def list_files(year: int = 0, user_id: int = 0) -> str:
+    """获取已上传的文件列表，返回文件名称、行数、类型等信息。year=0 表示所有年份。user_id 按用户过滤。"""
     from storage.database.db import get_session
     from ecommerce.models import ReportFile
 
     db = get_session()
     try:
         q = db.query(ReportFile)
+        if user_id > 0:
+            q = q.filter(ReportFile.user_id == user_id)
         if year > 0:
             q = q.filter(ReportFile.data_year == year)
         files = q.order_by(ReportFile.created_at.desc()).all()
@@ -91,7 +103,6 @@ def read_file_data(file_name: str, page: int = 1, page_size: int = 50) -> str:
     page: 页码（从1开始）
     page_size: 每页行数（最大500）
     """
-    ctx = request_context.get() or new_context(method="read_file_data")
     page_size = min(max(page_size, 1), 500)
 
     fp = _find_file(file_name)
@@ -138,8 +149,6 @@ def analyze_file_by_column(file_name: str, group_by_columns: str, agg_columns: s
 
     返回按分组列聚合后的结果，包含每组的总数、平均值等统计。
     """
-    ctx = request_context.get() or new_context(method="analyze_file_by_column")
-
     fp = _find_file(file_name)
     if not fp:
         return f"文件 '{file_name}' 不存在。"
@@ -213,21 +222,55 @@ def analyze_file_by_column(file_name: str, group_by_columns: str, agg_columns: s
 
 
 @tool
-def query_sales_data(year: int = 0, month: int = 0, report_name: str = "", limit: int = 50) -> str:
+def analyze_data_deep(file_name: str = "") -> str:
+    """
+    **核心分析工具**：对上传的 CSV 文件做全维度深度聚合分析，一次性返回所有维度的数据。
+    适合回答"分析数据"、"整体情况"、"表现怎么样"等开放性问题。
+
+    返回维度包括：
+    - 总览：总销量/销售额/利润/利润率/退款率/退款金额
+    - 费用结构：账单费/快递费/推广费/佣金等
+    - 主播排行 TOP15：每个主播的销量/销售额/利润率/退款率
+    - SKU 集中度：TOP5/10/20/50 占比
+    - 品牌分布、价格带分析、类目分布
+
+    file_name: 留空则分析最新上传的文件，或指定文件名如"9月.csv"
+    """
+    if not _HAS_ANALYSIS_MODULE:
+        return "分析模块未加载，请使用 analyze_file_by_column 进行手动分析。"
+
+    files = get_uploaded_files("uploads")
+    if file_name:
+        files = [f for f in files if os.path.basename(f) == file_name or file_name in os.path.basename(f)]
+    if not files:
+        comment_files = get_uploaded_files("comments")
+        if file_name:
+            comment_files = [f for f in comment_files if file_name in os.path.basename(f)]
+        if comment_files:
+            return analyze_comments_text(comment_files[0])
+        return "未找到可分析的数据文件。请先用 list_files 查看可用文件。"
+
+    return analyze_csv_text(files[0])
+
+
+@tool
+def query_sales_data(year: int = 0, month: int = 0, report_name: str = "", limit: int = 50, user_id: int = 0) -> str:
     """
     从数据库查询销售明细数据（SalesData表）。
     year=0 查所有年份，month=0 查所有月份。
     report_name 可按文件名筛选。
+    user_id 按用户过滤（0=管理员，查看全部）。
     此表包含以下字段：sku编码、商品名称、类目、版型、颜色、尺码、销量、销售额、成本、利润、利润率、退货数、退货率、库存。
     注意：数据库中可能不包含原始CSV中的"主播"字段，如需按主播分析请使用 analyze_file_by_column。
     """
-    ctx = request_context.get() or new_context(method="query_sales_data")
     from storage.database.db import get_session
     from ecommerce.models import SalesData
 
     db = get_session()
     try:
         q = db.query(SalesData)
+        if user_id > 0:
+            q = q.filter(SalesData.user_id == user_id)
         if year > 0:
             q = q.filter(SalesData.data_year == year)
         if month > 0:

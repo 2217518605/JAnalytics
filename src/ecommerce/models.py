@@ -22,6 +22,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), default="")
+    avatar_url: Mapped[str] = mapped_column(String(500), default="", comment="头像URL或路径")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=text("CURRENT_TIMESTAMP")
     )
@@ -56,6 +57,7 @@ class SalesData(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     # 数据归属
+    user_id: Mapped[int] = mapped_column(BigInteger, default=0, comment="所属用户ID", index=True)
     report_name: Mapped[str] = mapped_column(String(200), default="", comment="报表名称/来源文件名")
     data_year: Mapped[int] = mapped_column(Integer, default=2025, comment="年份")
     data_month: Mapped[int] = mapped_column(Integer, default=1, comment="月份 1-12")
@@ -90,6 +92,7 @@ class SalesData(Base):
     __table_args__ = (
         Index("idx_ec_sales_month", "data_year", "data_month"),
         Index("idx_ec_sales_sku", "sku_code"),
+        Index("idx_ec_sales_user", "user_id"),
     )
 
 
@@ -99,6 +102,7 @@ class ReportFile(Base):
     __tablename__ = "ec_report_file"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, default=0, comment="所属用户ID", index=True)
     file_name: Mapped[str] = mapped_column(String(500), nullable=False, comment="原文件名")
     file_size: Mapped[int] = mapped_column(BigInteger, default=0, comment="文件大小(bytes)")
     file_type: Mapped[str] = mapped_column(String(50), default="", comment="文件类型 csv/excel")
@@ -108,6 +112,10 @@ class ReportFile(Base):
     status: Mapped[str] = mapped_column(String(20), default="imported", comment="状态")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+    __table_args__ = (
+        Index("idx_ec_rf_user", "user_id"),
     )
 
 

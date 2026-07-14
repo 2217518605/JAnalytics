@@ -34,23 +34,12 @@ class S3SyncStorage:
     def _get_client(self):
         if self._client is None:
             endpoint = self.endpoint_url
-            if endpoint is None or endpoint == "":
-                try:
-                    from coze_workload_identity import Client as CozeEnvClient
-                    coze_env_client = CozeEnvClient()
-                    env_vars = coze_env_client.get_project_env_vars()
-                    coze_env_client.close()
-                    for env_var in env_vars:
-                        if env_var.key == "COZE_BUCKET_ENDPOINT_URL":
-                            endpoint = env_var.value.replace("'", "'\\''")
-                            self.endpoint_url = endpoint
-                            break
-                except Exception as e:
-                    logger.error(f"Error loading COZE_BUCKET_ENDPOINT_URL: {e}")
-                    # 保持向下校验逻辑，避免在此处中断
-            if endpoint is None or endpoint == "":
-                logger.error("未配置存储端点：请设置endpoint_url")
-                raise ValueError("未配置存储端点：请设置endpoint_url")
+            if not endpoint:
+                endpoint = os.environ.get("S3_ENDPOINT_URL") or os.environ.get("COZE_BUCKET_ENDPOINT_URL") or ""
+                self.endpoint_url = endpoint
+            if not endpoint:
+                logger.error("未配置存储端点：请设置 S3_ENDPOINT_URL 或 COZE_BUCKET_ENDPOINT_URL")
+                raise ValueError("未配置存储端点：请设置 S3_ENDPOINT_URL")
 
             client = boto3.client(
                 "s3",
@@ -60,26 +49,14 @@ class S3SyncStorage:
                 region_name=self.region,
             )
 
-            # 注册 before-call 钩子，发送前注入 x-storage-token 头
-            def _inject_header(**kwargs):
-                try:
-                    from coze_workload_identity import Client as CozeClient
-                    coze_client = CozeClient()
-                    try:
-                        token = coze_client.get_access_token()
-                    except Exception as e:
-                        logger.error("Error loading COZE_WORKLOAD_IDENTITY_TOKEN: %s", e)
-                        token = None
-                        raise e
-                    finally:
-                        coze_client.close()
+            # 可选: 如果设置了 S3_STORAGE_TOKEN, 注入 x-storage-token 头
+            storage_token = os.environ.get("S3_STORAGE_TOKEN") or os.environ.get("COZE_BUCKET_STORAGE_TOKEN")
+            if storage_token:
+                def _inject_header(**kwargs):
                     params = kwargs.get("params", {})
                     headers = params.setdefault("headers", {})
-                    headers["x-storage-token"] = token
-                except Exception as e:
-                    logger.error("Error loading COZE_WORKLOAD_IDENTITY_TOKEN: %s", e)
-                    pass
-            client.meta.events.register("before-call.s3", _inject_header)
+                    headers["x-storage-token"] = storage_token
+                client.meta.events.register("before-call.s3", _inject_header)
             self._client = client
         return self._client
 
@@ -234,20 +211,10 @@ class S3SyncStorage:
         """通过 S3 Proxy 生成签名 URL。"""
         import json
         import urllib.request as urllib_request
-        try:
-            from coze_workload_identity import Client as CozeClient
-            coze_client = CozeClient()
-            try:
-                token = coze_client.get_access_token()
-            finally:
-                try:
-                    coze_client.close()
-                except Exception:
-                    # 资源释放失败不影响后续流程
-                    pass
-        except Exception as e:
-            logger.error(f"Error loading x-storage-token: {e}")
-            raise RuntimeError(f"获取 x-storage-token 失败: {e}")
+
+        storage_token = os.environ.get("S3_STORAGE_TOKEN") or os.environ.get("COZE_BUCKET_STORAGE_TOKEN")
+        if not storage_token:
+            raise RuntimeError("未设置 S3_STORAGE_TOKEN — 无法生成签名 URL")
         try:
             sign_base = os.environ.get("COZE_BUCKET_ENDPOINT_URL") or self.endpoint_url
             if not sign_base:
@@ -256,7 +223,7 @@ class S3SyncStorage:
 
             headers = {
                 "Content-Type": "application/json",
-                "x-storage-token": token,
+                "x-storage-token": storage_token,
             }
 
             target_bucket = self._resolve_bucket(bucket)
