@@ -1628,8 +1628,7 @@ async def ec_upload(file: UploadFile = File(...), data_year: int = Form(date.tod
                 csv_path = os.path.join(comment_dir, save_name)
                 df.to_csv(csv_path, index=False, encoding="utf-8-sig")
                 csv_size = os.path.getsize(csv_path)
-                db.add(ReportFile(user_id=uid, file_name=save_name, file_size=csv_size, file_type="comment", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(df)))
-                db.commit()
+                _upsert_report_file(file_name=save_name, user_id=uid, file_size=csv_size, file_type="comment", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(df))
                 # 评论数据已保存为 CSV 在 assets/comments/，无需额外复制 XLSX 到 uploads
                 _update_task(task_id, status="completed", message=f"成功导入评论数据 {len(df)} 条", row_count=len(df))
                 return
@@ -1652,8 +1651,7 @@ async def ec_upload(file: UploadFile = File(...), data_year: int = Form(date.tod
                 _update_task(task_id, progress=f"正在写入数据库 ({len(records)} 条)...")
                 db.add_all(records)
                 db.commit()
-            db.add(ReportFile(user_id=uid, file_name=file.filename, file_size=os.path.getsize(tmp_path), file_type="csv" if fn.endswith(".csv") else "excel", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(records)))
-            db.commit()
+            _upsert_report_file(file_name=file.filename, user_id=uid, file_size=os.path.getsize(tmp_path), file_type="csv" if fn.endswith(".csv") else "excel", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(records))
             # 复制到 uploads/
             _copy_to_uploads(tmp_path, file.filename, uid)
             _track_session_file("default", tmp_path, uid)
@@ -1742,8 +1740,7 @@ async def ec_ask_upload(file: UploadFile = File(...), session_id: str = Form("")
                 csv_path = os.path.join(comment_dir, save_name)
                 df.to_csv(csv_path, index=False, encoding="utf-8-sig")
                 csv_size = os.path.getsize(csv_path)
-                db.add(ReportFile(user_id=uid, file_name=save_name, file_size=csv_size, file_type="comment", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(df)))
-                db.commit()
+                _upsert_report_file(file_name=save_name, user_id=uid, file_size=csv_size, file_type="comment", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(df))
                 _copy_to_uploads(tmp_path, file.filename, uid)
                 _track_session_file(session_id or "default", tmp_path)
                 _update_task(task_id, status="completed", message=f"成功导入评论数据 {len(df)} 条", row_count=len(df))
@@ -1766,8 +1763,7 @@ async def ec_ask_upload(file: UploadFile = File(...), session_id: str = Form("")
                 _update_task(task_id, progress=f"正在写入数据库 ({len(records)} 条)...")
                 db.add_all(records)
                 db.commit()
-            db.add(ReportFile(user_id=uid, file_name=file.filename, file_size=os.path.getsize(tmp_path), file_type="csv" if fn.endswith(".csv") else "excel", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(records)))
-            db.commit()
+            _upsert_report_file(file_name=file.filename, user_id=uid, file_size=os.path.getsize(tmp_path), file_type="csv" if fn.endswith(".csv") else "excel", data_year=data_year, report_period=f"{data_year}-{file_month:02d}", row_count=len(records))
             _copy_to_uploads(tmp_path, file.filename, uid)
             _track_session_file(session_id or "default", tmp_path)
             _update_task(task_id, status="completed", message=f"成功导入 {len(records)} 条", row_count=len(records))
@@ -1792,22 +1788,45 @@ async def ec_task_status(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
     return task
 
-def _create_report_record(year: int, month: int, report_name: str, row_count: int, file_type: str = "csv", user_id: int = 0):
-    """创建报表记录"""
+def _upsert_report_file(file_name: str, user_id: int, file_size: int = 0, file_type: str = "csv", data_year: int = date.today().year, report_period: str = "", row_count: int = 0):
+    """创建或更新报表记录（按 file_name + user_id 去重，防止重复上传产生冗余记录）"""
     db = _ec_db()
     try:
-        db.add(ReportFile(
-            user_id=user_id,
-            file_name=report_name + ".csv",
-            file_size=0,
-            file_type=file_type,
-            data_year=year,
-            report_period=f"{year}-{month:02d}",
-            row_count=row_count,
-        ))
+        existing = db.query(ReportFile).filter(
+            ReportFile.file_name == file_name,
+            ReportFile.user_id == user_id,
+        ).first()
+        if existing:
+            existing.file_size = file_size or existing.file_size
+            existing.file_type = file_type
+            existing.data_year = data_year
+            existing.report_period = report_period or f"{data_year}-{date.today().month:02d}"
+            existing.row_count = row_count or existing.row_count
+        else:
+            db.add(ReportFile(
+                user_id=user_id,
+                file_name=file_name,
+                file_size=file_size,
+                file_type=file_type,
+                data_year=data_year,
+                report_period=report_period or f"{data_year}-{date.today().month:02d}",
+                row_count=row_count,
+            ))
         db.commit()
     finally:
         db.close()
+
+
+def _create_report_record(year: int, month: int, report_name: str, row_count: int, file_type: str = "csv", user_id: int = 0):
+    """创建或更新报表记录（按 file_name + user_id 去重）"""
+    _upsert_report_file(
+        file_name=report_name + ".csv",
+        user_id=user_id,
+        file_type=file_type,
+        data_year=year,
+        report_period=f"{year}-{month:02d}",
+        row_count=row_count,
+    )
 
 # ----- 批量上传（客户端解析CSV分块上传，绕过代理超时）-----
 _session_batches: dict[str, dict] = {}  # session_id -> {"total_rows": int, "received": int, "file_name": str, ...}
@@ -2165,38 +2184,58 @@ async def ec_data_files_batch_delete(req: dict):
 
 @app.get("/api/data/stats")
 async def ec_data_stats():
-    """返回所有数据表的统计概览（仅当前用户）"""
+    """返回所有数据表的统计概览（仅当前用户）
+
+    使用「合并视图」统计文件数：DB ReportFile + 物理磁盘文件 → 去重后即为实际文件数。
+    这样无论文件是通过哪种方式上传的，统计结果都与文件管理页保持一致。
+    """
     import os as _os
     db = _ec_db()
     uid = _uid()
+    _valid_exts = {".csv", ".xlsx", ".xls"}
     try:
         sales_count = db.query(SalesData).filter(SalesData.user_id == uid).count()
-        report_count = db.query(ReportFile).filter(ReportFile.user_id == uid).count()
+
         conv_count = db.query(Conversation).filter(Conversation.user_id == uid).count()
         session_count = db.query(Conversation.session_id).filter(Conversation.user_id == uid).distinct().count()
         image_count = db.query(GeneratedImage).filter(GeneratedImage.user_id == uid).count()
 
-        # 物理文件统计（用户专属目录）
-        upload_files = 0
-        upload_size = 0
+        # ── 文件统计：DB 记录 + 物理文件 → 合并去重 ──
+        db_names = set()
+        for (fn,) in db.query(ReportFile.file_name).filter(ReportFile.user_id == uid).distinct().all():
+            db_names.add(fn)
+
+        physical_files = 0
+        physical_size = 0
+        physical_names = set()
         for d in (_user_uploads_dir(uid), _user_comments_dir(uid)):
             if _os.path.isdir(d):
                 for fn in _os.listdir(d):
+                    if fn.startswith("."):
+                        continue
+                    ext = _os.path.splitext(fn)[1].lower()
+                    if ext not in _valid_exts:
+                        continue
                     fp = _os.path.join(d, fn)
-                    if _os.path.isfile(fp) and not fn.startswith("."):
-                        upload_files += 1
-                        upload_size += _os.path.getsize(fp)
+                    if _os.path.isfile(fp):
+                        physical_names.add(fn)
+                        physical_files += 1
+                        physical_size += _os.path.getsize(fp)
+
+        # 合并视图：DB 有的 + 磁盘有的 = 所有文件
+        all_file_names = db_names | physical_names
+        total_file_count = len(all_file_names)
 
         return {
             "success": True,
             "stats": {
                 "sales_rows": sales_count,
-                "report_files": report_count,
+                "report_files": total_file_count,
                 "conversations": conv_count,
                 "sessions": session_count,
                 "generated_images": image_count,
-                "upload_files": upload_files,
-                "upload_size_mb": round(upload_size / 1024 / 1024, 2),
+                "upload_files": total_file_count,
+                "upload_size_mb": round(physical_size / 1024 / 1024, 2),
             }
         }
     finally:
