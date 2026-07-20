@@ -848,6 +848,18 @@ _avatar_dir = os.path.join(PROJECT_ROOT, "assets", "avatars")
 os.makedirs(_avatar_dir, exist_ok=True)
 app.mount("/avatars", StaticFiles(directory=_avatar_dir), name="avatars")
 
+# 电商前端静态文件
+_ec_static = os.path.join(PROJECT_ROOT, "assets", "ecommerce")
+if os.path.isdir(_ec_static):
+    app.mount("/ecommerce", StaticFiles(directory=_ec_static, html=True), name="ecommerce")
+
+
+@app.get("/")
+async def root():
+    """根路径重定向到电商面板"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/ecommerce")
+
 def _ec_db():
     return get_session()
 
