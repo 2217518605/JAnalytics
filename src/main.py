@@ -2928,17 +2928,51 @@ async def ec_ask(req: AskRequest):
                 if line.startswith("### 📦"):
                     break
 
-            # 解析该主播的精确数字（Markdown 表格 split 后 [0] 为空，索引从 1 开始）
+            # 解析该主播的精确数字
             anchor_parts = [p.strip() for p in anchor_line.split("|")] if anchor_line else []
             anchor_numbers = ""
-            # 格式: | 排名 | 主播 | 销量 | 销售额 | 利润率 | 退款率 |
+            anchor_answers = ""  # 直接回答常见问题的答案
+            # 格式: | 排名 | 主播 | 销量(扣退) | 销售额(扣退) | 利润率 | 退款率 |
             if len(anchor_parts) >= 7:
+                _vol = anchor_parts[3]  # e.g. "3,733件"
+                _amt = anchor_parts[4]  # e.g. "¥602,659.15"
                 anchor_numbers = (
-                    f"- 销量: {anchor_parts[3]}\n"
-                    f"- 销售额: {anchor_parts[4]}\n"
+                    f"- 销量(扣退): {_vol}\n"
+                    f"- 销售额(扣退): {_amt}\n"
                     f"- 经营利润率: {anchor_parts[5]}\n"
                     f"- 退款率: {anchor_parts[6]}\n"
                 )
+                anchor_answers = (
+                    f"## 用户可能问的指标，直接用以下数字回答\n"
+                    f"- 实际成交件数: {_vol}\n"
+                    f"- 实际成交金额: {_amt}\n"
+                    f"- 销售额: {_amt}\n"
+                )
+
+            # 从结构化数据补全实发件数/金额 & 退款数量/金额
+            struct_extra = ""
+            if target_files and focus_anchor:
+                try:
+                    from ecommerce.analysis import analyze_csv_structured
+                    _s = analyze_csv_structured(target_files[0])
+                    for _z in (_s.get("top_zhubo") or []):
+                        if _z.get("zhubo") == focus_anchor:
+                            _sq = _z.get("ship_qty", 0) or 0
+                            _sa = _z.get("ship_amt", 0) or 0
+                            _rq = _z.get("refund_qty", 0) or 0
+                            _ra = _z.get("refund_amt", 0) or 0
+                            if _sq > 0 or _sa > 0:
+                                struct_extra = (
+                                    f"- 实发件数: {_sq:,} 件\n"
+                                    f"- 实发金额: {_sa:,.2f} 元\n"
+                                    f"- 退款数量: {_rq:,} 件\n"
+                                    f"- 退款金额: {_ra:,.2f} 元\n"
+                                )
+                            break
+                except Exception:
+                    pass
+            if struct_extra:
+                anchor_numbers += "\n" + struct_extra
 
             # 大盘对比 — 从 overview 提取
             from ecommerce.analysis import analyze_csv_structured
@@ -2964,9 +2998,13 @@ async def ec_ask(req: AskRequest):
 
             focused_data = (
                 f"## {focus_anchor} — 精确数据（以下数字必须原样引用，不得改写）\n\n"
-                f"⚠️ 注意：销量和销售额已经是「扣退后」的净数据，不要再用退款率去折算它们。\n\n"
-                f"{anchor_numbers}\n"
-                f"大盘对比:\n{benchmark}\n"
+                f"⚠️ 术语说明（严格遵守）：\n"
+                f"- 「实际成交」= 扣退后净数据（已扣除退货的最终确认数据）\n"
+                f"- 「实际发货」= 仓库实际发出的数量和金额（含后续退货）\n\n"
+                f"{anchor_answers}\n"
+                f"## 完整数据\n{anchor_numbers}\n"
+                f"## 实发与退款\n{struct_extra}\n"
+                f"## 大盘对比\n{benchmark}\n"
             )
             if peer_context:
                 focused_data += (
@@ -2976,9 +3014,8 @@ async def ec_ask(req: AskRequest):
                 )
             llm_data = focused_data
             source_hint = f"**数据来源：{os.path.basename(target_files[0])}** — 聚焦 {focus_anchor}"
-            # 返回 TOP 排名表给前端展示
-            if top_anchor_lines:
-                zhubo_table = "### 👤 主播排名\n\n" + "\n".join(top_anchor_lines[:16])
+            # 聚焦单一主播时不需要前端表格，LLM 回答已包含所有数据
+            zhubo_table = ""
 
         # ---- 3. 无数据处理：用户没指定分析目标 ----
         if ctx["file_source"] == "unspecified":
@@ -3070,12 +3107,18 @@ async def ec_ask(req: AskRequest):
 - **来源/渠道** → 如果数据中有「成交来源分布」表，务必分析各渠道的销量、利润率差异，指出最赚钱的渠道和低效渠道
 
 # 回答规则
-1. **如果用户问的是具体数值（"多少""几个""多少钱"），第一句话必须直接给出数字**，然后再展开分析。❌ 错误：上来就分析趋势。✅ 正确：「兰知春序3月销售额 ¥602,659，销量 3,733件。其中...」
+1. **回答结构：先答数字，再给分析**。用户问某个主播的具体数据时，标准模板：
+   第一句：「{主播} {月份}实际成交金额 ¥XXX，销售额 ¥XXX，实际成交 XXX件。」
+   然后另起一段「**核心解读：**」从以下角度展开：
+   · 排名定位 — 在全品类中的位置，和头部/同级主播的差距
+   · 利润率 — vs 大盘均值、vs 排名相邻主播，判断赚钱效率
+   · 退款表现 — vs 大盘，实发金额 vs 净销售额的差距，分析转化效率
+   · 可执行建议 — 具体、可落地的优化方向
+   ⚠️ 禁止只给数字不分析，也禁止只分析不给数字。两者缺一不可。
 2. 用**加粗小标题**组织，段落间空一行
 3. 数字用千分位（5,865件），金额用 ¥ 前缀
-4. 指出异常和风险，给出可执行建议
-5. 合适的地方用表格替代长篇文字描述。**表格必须另起一行，前面不能接文字。**
-6. **重要：所有的"销量""销售额"均已扣除退货（扣退后数据），不要再用退款率去折算这些数字** — 退款率只是告诉你退货规模有多大，不是让你对已扣退的数字做二次扣减"""
+4. 表格在对比场景才用，单体分析用文字即可
+5. **重要：所有的"销量""销售额"均已扣除退货（扣退后数据），不要再用退款率去折算这些数字**"""
         prompt = f"{source_hint}\n\n【全维度深度数据 — 仅供你分析，数字必须精确引用，不要在回答中重复原文】\n{llm_data}\n\n【用户问题】\n{req.question}"
         answer = _call_llm(prompt=prompt, system_prompt=sp, temperature=0.3, max_tokens=32768)
         # 压缩多余空行
