@@ -24,6 +24,34 @@ from utils.paths import PROJECT_ROOT
 logger = logging.getLogger(__name__)
 
 # ============================================================
+# 通用工具函数
+# ============================================================
+
+def _parse_sku_display(sku_code: str):
+    """解析 SKU 编码为展示格式。
+
+    将 "522003C丹宁色28" 解析为:
+      display: "522003C 丹宁色 28"  (用于 SKU 编码列)
+      model:   "522003C"             (款号)
+
+    若无法解析，退回原字符串作为 display 和 model。
+    """
+    code = sku_code.strip()
+    if not code:
+        return code, code
+    # 匹配: 字母数字款号 + 中文颜色 + 数字尺码
+    m = re.match(r'^([A-Za-z0-9]+)([一-鿿]+)(\d+)$', code)
+    if m:
+        model, color, size = m.group(1), m.group(2), m.group(3)
+        return f"{model} {color} {size}", model
+    # Fallback: 尝试把末尾数字分离出来
+    m2 = re.match(r'^(.+?)(\d+)$', code)
+    if m2:
+        return f"{m2.group(1)} {m2.group(2)}", m2.group(1)
+    return code, code
+
+
+# ============================================================
 # 通用 CSV 读取 + 列名检测
 # ============================================================
 
@@ -472,14 +500,14 @@ def analyze_csv_text(file_path: str) -> str:
     if r["top_sku"]:
         rows.append(f"### 📦 SKU TOP10（共 {r['sku_count']} 个）")
         rows.append("")
-        rows.append("| 排名 | SKU | 商品名称 | 销量 | 销售额 | 利润 | 占比 |")
-        rows.append("|------|-----|----------|------|--------|------|------|")
+        rows.append("| 排名 | SKU 编码 | 款号 | 商品名称 | 总销量 | 总销售额 |")
+        rows.append("|------|----------|------|----------|--------|----------|")
         for i, s in enumerate(r["top_sku"][:10], 1):
+            display_code, model_code = _parse_sku_display(s["product_code"])
             name = s.get("product_name", "") or "-"
-            profit_str = f"¥{s.get('profit', 0):,.2f}" if s.get("profit", 0) > 0 else "—"
             rows.append(
-                f"| {i} | {s['product_code'][:30]} | {name[:20]} | "
-                f"{s['vol']:,}件 | ¥{s['amt']:,.2f} | {profit_str} | {s['share']}% |"
+                f"| {i} | {display_code} | {model_code} | {name[:20]} | "
+                f"{s['vol']:,} 件 | {s['amt']:,.2f} 元 |"
             )
         # 集中度
         conc_parts = []
@@ -488,7 +516,7 @@ def analyze_csv_text(file_path: str) -> str:
             if ov.get(key):
                 conc_parts.append(f"TOP{top_n}={ov[key]}%")
         if conc_parts:
-            rows.append(f"| | **集中度** | {' · '.join(conc_parts)} | |")
+            rows.append(f"| | **集中度** | {' · '.join(conc_parts)} | | | |")
         rows.append("")
 
     # ---- 品牌表格 ----

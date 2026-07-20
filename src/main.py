@@ -1111,42 +1111,36 @@ def _get_zhubo_markdown_table(db, target_month=None, top_n=10, filter_zhubo=None
     return "\n".join(lines)
 
 def _get_sku_markdown_table(db, target_month=None, top_n=10):
-    """生成SKU销量排名Markdown表格"""
-    rows = db.query(SalesData).filter(SalesData.user_id == _uid()).all()
-    if not rows: return ""
-    year = rows[0].data_year
-    # 从extra_data解析
-    records = []
-    for r in rows:
-        if target_month and r.data_month != target_month: continue
-        ed = r.extra_data or {}
-        sku = str(ed.get("商品编码") or r.sku_code or "").strip()
-        if not sku: continue
-        vol = _parse_kv(ed, ["利润-销售数量(扣退)","销售数量(扣退)","sales_volume"]) or (float(r.sales_volume or 0))
-        amt = _parse_kv(ed, ["利润-销售金额(扣退)","销售金额(扣退)","sales_amount"]) or (float(r.sales_amount or 0))
-        profit = _parse_kv(ed, ["利润-毛利额","毛利额","profit"]) or (float(r.profit or 0))
-        records.append({"sku": sku, "vol": vol, "amt": amt, "profit": profit})
-    # 按SKU聚合
+    """生成SKU销量排名Markdown表格（DB兜底）"""
     from collections import defaultdict
-    sdata = defaultdict(lambda: {"vol":0,"amt":0,"profit":0})
-    for r in records:
-        sdata[r["sku"]]["vol"] += r["vol"]
-        sdata[r["sku"]]["amt"] += r["amt"]
-        sdata[r["sku"]]["profit"] += r["profit"]
-    # 排序取TOP
+    from ecommerce.analysis import _parse_sku_display
+    rows = db.query(SalesData).filter(SalesData.user_id == _uid()).all()
+    if not rows:
+        return ""
+    # 聚合：按 SKU 编码汇总
+    sdata = defaultdict(lambda: {"vol": 0, "amt": 0, "name": ""})
+    for r in rows:
+        if target_month and r.data_month != target_month:
+            continue
+        sku = (r.sku_code or "").strip()
+        if not sku:
+            continue
+        sdata[sku]["vol"] += int(r.sales_volume or 0)
+        sdata[sku]["amt"] += float(r.sales_amount or 0)
+        if not sdata[sku]["name"] and r.product_name:
+            sdata[sku]["name"] = str(r.product_name).strip()
+    # 排序取 TOP
     sorted_sku = sorted(sdata.items(), key=lambda x: -x[1]["vol"])[:top_n]
-    if not sorted_sku: return ""
+    if not sorted_sku:
+        return ""
     lines = [""]
-    if target_month:
-        lines.append(f"| SKU编码 | {target_month}月销量 | {target_month}月销售额 | 毛利额 |")
-    else:
-        lines.append("| SKU编码 | 总销量 | 总销售额 | 毛利额 |")
-    lines.append("| --- | --- | --- | --- |")
-    for sku, d in sorted_sku:
-        vol_s = f"{d['vol']:,.0f}"
-        amt_s = f"¥{d['amt']:,.2f}"
-        profit_s = f"¥{d['profit']:,.2f}" if d['profit'] > 0 else "—"
-        lines.append(f"| {sku} | {vol_s} | {amt_s} | {profit_s} |")
+    month_label = f"{target_month}月 " if target_month else ""
+    lines.append(f"| 排名 | SKU 编码 | 款号 | 商品名称 | {month_label}总销量 | {month_label}总销售额 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for i, (sku, d) in enumerate(sorted_sku, 1):
+        display_code, model_code = _parse_sku_display(sku)
+        name = d["name"] or "-"
+        lines.append(f"| {i} | {display_code} | {model_code} | {name[:20]} | {d['vol']:,} 件 | {d['amt']:,.2f} 元 |")
     return "\n".join(lines)
 
 def _get_comment_table(question: str, target_month=None):
@@ -2457,18 +2451,44 @@ def _get_sku_from_csv_for_file(file_path: str, top_n=20, label: str = "") -> str
     """从指定 CSV 文件读取 SKU 销售排行数据。label 用于表头标注月份。"""
     import pandas as pd
     from tools.data_query_tools import _read_file_to_df
+    from ecommerce.analysis import _parse_sku_display
     sku_cols = ["sku编码", "sku_code", "商品编码", "SKU编码"]
     try:
         df = _read_file_to_df(file_path)
         sku_col = next((c for c in sku_cols if c in df.columns), None)
         qty_col = next((c for c in df.columns if "商品销售数据-商品销售数量(扣退)" in c or "销量" in c or "销售数量" in c), None)
+        amt_col = next((c for c in df.columns if "商品销售数据-商品销售金额(扣退)" in c or "销售额" in c or "销售金额" in c), None)
+        name_col = next((c for c in df.columns if c in ("商品简称", "商品名称", "产品名称") or "商品简称" in c), None)
         if sku_col and qty_col:
-            sku_data = df.groupby(sku_col)[qty_col].sum().sort_values(ascending=False).head(top_n)
+            # 聚合：按 SKU 编码汇总 销量 + 销售额
+            agg_map = {qty_col: "sum"}
+            if amt_col and amt_col in df.columns:
+                agg_map[amt_col] = "sum"
+            grouped = df.groupby(sku_col).agg(agg_map).fillna(0)
+            # 按销量降序
+            sort_col = qty_col
+            grouped = grouped.sort_values(sort_col, ascending=False).head(top_n)
+
+            # 预建 SKU→商品名称 映射
+            sku_name_map = {}
+            if name_col and name_col in df.columns:
+                for _, row in df[[sku_col, name_col]].dropna(subset=[name_col]).iterrows():
+                    code = str(row[sku_col]).strip()
+                    if code and code not in sku_name_map:
+                        nm = str(row[name_col]).strip()
+                        if nm and nm.lower() not in ("nan", "none", ""):
+                            sku_name_map[code] = nm
+
             header = f"## {label} SKU TOP{top_n}" if label else f"## SKU TOP{top_n}"
-            lines = [header, "", "| 排名 | SKU | 销量(扣退) |", "| --- | --- | --- |"]
-            for i, (sku, qty) in enumerate(sku_data.items(), 1):
-                lines.append(f"| {i} | {sku} | {int(qty)} |")
-            return "\n".join(lines) + f"\n\n共 {len(sku_data)} 个 SKU"
+            lines = [header, "", "| 排名 | SKU 编码 | 款号 | 商品名称 | 总销量 | 总销售额 |", "| --- | --- | --- | --- | --- | --- |"]
+            for i, (sku, row) in enumerate(grouped.iterrows(), 1):
+                code = str(sku).strip()
+                display_code, model_code = _parse_sku_display(code)
+                name = sku_name_map.get(code, "-")
+                vol = int(row[qty_col])
+                amt = float(row[amt_col]) if amt_col and amt_col in row.index else 0.0
+                lines.append(f"| {i} | {display_code} | {model_code} | {name[:20]} | {vol:,} 件 | {amt:,.2f} 元 |")
+            return "\n".join(lines) + f"\n\n共 {len(grouped)} 个 SKU"
     except Exception:
         pass
     return ""
@@ -2576,6 +2596,29 @@ def _detect_question_context(question: str, session_id: str = "", previous_month
     top_match = _re.search(r'前\s*(\d+)', q)
     if top_match:
         ctx["top_n"] = min(int(top_match.group(1)), 50)
+    else:
+        # 支持中文数字：前十→10, 前二十→20, 前十五→15, 前三十→30 等
+        _cn_num_map = {
+            "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+        }
+        cn_top = _re.search(r'前\s*([一二两三四五六七八九十]+)', q)
+        if cn_top:
+            raw = cn_top.group(1)
+            if raw == "十":
+                ctx["top_n"] = 10
+            elif raw.endswith("十"):
+                # 二十/三十/四十... → 20/30/40...
+                tens = _cn_num_map.get(raw[0], 0)
+                ctx["top_n"] = min(tens * 10, 50) if tens > 0 else 10
+            elif raw.startswith("十"):
+                # 十一/十二/十三... → 11/12/13...
+                ones = _cn_num_map.get(raw[1], 0) if len(raw) > 1 else 0
+                ctx["top_n"] = min(10 + ones, 50)
+            else:
+                # 单字: 三→3, 五→5 等（"前三"这种说法）
+                val = _cn_num_map.get(raw, 0)
+                ctx["top_n"] = min(val, 50) if val > 0 else 10
 
     # ── 5. 文件定位：按月份匹配 ──
     def _is_comment_file(fp):
@@ -2742,6 +2785,12 @@ async def ec_ask(req: AskRequest):
             sp = """# 角色定义
 你是顶级电商数据分析师，精通女装牛仔裤品类的商品管理与销售分析。分析风格犀利、数据驱动、一针见血。
 
+# ⚠️ 铁律：禁止输出表格
+- 系统已将完整的数据表渲染在对话上方，用户已经看到了表格。
+- **绝对禁止在你的回答中重复输出任何表格（包括简化的表格）。**
+- 如果用户没有要求具体数据明细，直接从分析维度切入，不要列出数据行。
+- 违反此规则会导致用户看到两份相同的表格，体验极差。
+
 # 核心分析维度
 1. **爆品特征**：哪些款式/颜色/尺码是爆款？共同特征？
 2. **销售集中度**：TOP SKU销量占比，是否过度依赖某几个款？
@@ -2750,9 +2799,8 @@ async def ec_ask(req: AskRequest):
 
 # 回答规则
 1. 所有分析基于提供的数据，**禁止编造**
-2. **数据表已在上方独立展示，不要重复输出完整表格！** 直接给分析结论
-3. 对比几个SKU时用内联格式（如"丹宁色28（1,987件 → 1,720件，↓13%）"），不要用完整表格
-4. 用数据说话，简洁有力，指出异常和风险"""
+2. 需要对比具体SKU时，用内联格式引用（如"522003C 丹宁色 28（515件，¥71,678.79）"），不要列成表格
+3. 用数据说话，简洁有力，指出异常和风险"""
             data_parts = [f"SKU数据（{ctx['file_source']}）：\n{sku_table}"]
             if sku_enhanced:
                 data_parts.append(f"增强分析：\n{sku_enhanced}")
