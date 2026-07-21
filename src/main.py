@@ -3584,7 +3584,7 @@ async def ec_index():
 def parse_args():
     parser = argparse.ArgumentParser(description="Start FastAPI server")
     parser.add_argument("-m", type=str, choices=["http", "flow", "node", "agent"], default="http", help="运行模式")
-    parser.add_argument("-p", type=int, default=5000, help="HTTP服务端口")
+    parser.add_argument("-p", type=int, default=8002, help="HTTP服务端口")
     parser.add_argument("-n", type=str, default=None, help="节点名称")
     parser.add_argument("-i", type=str, default=None, help="输入数据")
     return parser.parse_args()
