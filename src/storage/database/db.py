@@ -20,12 +20,16 @@ except Exception:
 def get_db_url() -> str:
     """Build database URL from environment.
 
-    Priority: PGDATABASE_URL > DATABASE_URL (Railway auto-inject)
+    Priority: PGDATABASE_URL > DATABASE_URL > SQLite fallback
     """
     url = os.getenv("PGDATABASE_URL") or os.getenv("DATABASE_URL") or ""
     if not url:
-        logger.error("PGDATABASE_URL (or DATABASE_URL) is not set — please set it in .env or environment")
-        raise ValueError("PGDATABASE_URL (or DATABASE_URL) is not set")
+        # SQLite 兜底 — 免数据库也能跑
+        import sys
+        _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "ecommerce.db")
+        _db_path = os.path.normpath(_db_path)
+        url = f"sqlite:///{_db_path}"
+        logger.warning(f"No PostgreSQL URL set — using SQLite fallback: {_db_path}")
     return url
 _engine = None
 _SessionLocal = None
@@ -33,8 +37,14 @@ _SessionLocal = None
 def _create_engine_with_retry():
     url = get_db_url()
     if url is None or url == "":
-        logger.error("PGDATABASE_URL is not set")
-        raise ValueError("PGDATABASE_URL is not set")
+        logger.error("No database URL configured")
+        raise ValueError("No database URL configured")
+
+    is_sqlite = url.startswith("sqlite")
+    if is_sqlite:
+        engine = create_engine(url, connect_args={"check_same_thread": False})
+        return engine
+
     size = 100
     overflow = 100
     recycle = 1800
