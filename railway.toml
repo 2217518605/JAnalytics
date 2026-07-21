@@ -6,3 +6,10 @@
 
 [service]
   name = "denim-view"
+
+  [service.env]
+    PGDATABASE_URL = "${{Postgres.DATABASE_URL}}"
+    OPENAI_MODEL = "deepseek-v4-pro"
+    OPENAI_BASE_URL = "https://api.deepseek.com"
+    COZE_PROJECT_TYPE = "agent"
+    COZE_PROJECT_ENV = "PROD"
