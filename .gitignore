@@ -32,6 +32,9 @@ build/
 # Claude Code
 .claude/
 
+# Local SQLite database
+*.db
+
 # Temporary files
 tmp/
 *.tmp

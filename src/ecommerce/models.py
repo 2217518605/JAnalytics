@@ -9,6 +9,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, registry
 from typing import Optional, List
 import enum
 
+# SQLite 只对 INTEGER PRIMARY KEY 自增，BIGINT 不会自增
+# PostgreSQL 下用 BigInteger，SQLite 下退化为 Integer
+PKType = BigInteger().with_variant(Integer(), "sqlite")
+
 # 使用独立的 registry 避免与项目中其他 Base 冲突
 mapper_registry = registry()
 Base = mapper_registry.generate_base()
@@ -18,7 +22,7 @@ Base = mapper_registry.generate_base()
 class User(Base):
     __tablename__ = "ec_user"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), default="")
@@ -55,7 +59,7 @@ class SalesData(Base):
     """销售数据 - 按月份/季度存储的牛仔裤销售明细"""
     __tablename__ = "ec_sales_data"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     # 数据归属
     user_id: Mapped[int] = mapped_column(BigInteger, default=0, comment="所属用户ID", index=True)
     report_name: Mapped[str] = mapped_column(String(200), default="", comment="报表名称/来源文件名")
@@ -101,7 +105,7 @@ class ReportFile(Base):
     """上传的报表文件记录"""
     __tablename__ = "ec_report_file"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, default=0, comment="所属用户ID", index=True)
     file_name: Mapped[str] = mapped_column(String(500), nullable=False, comment="原文件名")
     file_size: Mapped[int] = mapped_column(BigInteger, default=0, comment="文件大小(bytes)")
@@ -124,7 +128,7 @@ class Conversation(Base):
     """AI问答对话历史"""
     __tablename__ = "ec_conversation"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, default=0, comment="用户ID")
     session_id: Mapped[str] = mapped_column(String(100), default="", comment="会话ID")
     role: Mapped[str] = mapped_column(String(20), default="user", comment="user/assistant")
@@ -146,7 +150,7 @@ class GeneratedImage(Base):
     """AI生图记录"""
     __tablename__ = "ec_generated_image"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, default=0)
     prompt: Mapped[str] = mapped_column(Text, default="", comment="生成提示词")
     image_url: Mapped[str] = mapped_column(Text, default="", comment="图片URL")
@@ -162,7 +166,7 @@ class SessionFile(Base):
     """会话关联的上传文件 - 用于电商小助手按文件问答"""
     __tablename__ = "ec_session_file"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(100), default="", comment="会话ID", index=True)
     file_name: Mapped[str] = mapped_column(String(500), default="", comment="原文件名")
     file_size: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -186,7 +190,7 @@ class DashboardCache(Base):
     """数据看板聚合缓存"""
     __tablename__ = "ec_dashboard_cache"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PKType, primary_key=True, autoincrement=True)
     cache_key: Mapped[str] = mapped_column(String(100), unique=True, comment="缓存键")
     cache_data: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime.datetime] = mapped_column(

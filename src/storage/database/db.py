@@ -28,7 +28,7 @@ def get_db_url() -> str:
         import sys
         _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "ecommerce.db")
         _db_path = os.path.normpath(_db_path)
-        url = f"sqlite:///{_db_path}"
+        url = f"sqlite:///{_db_path.replace(os.sep, '/')}"
         logger.warning(f"No PostgreSQL URL set — using SQLite fallback: {_db_path}")
     return url
 _engine = None

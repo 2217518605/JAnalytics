@@ -97,6 +97,11 @@ class MemoryManager:
         if not db_url:
             return self._create_fallback_checkpointer()
 
+        # SQLite 不支持 PostgresSaver，直接走 MemorySaver 兜底
+        if db_url.startswith("sqlite"):
+            logger.warning("SQLite detected, skipping PostgresSaver — using MemorySaver")
+            return self._create_fallback_checkpointer()
+
         # 2. 尝试连接数据库并创建 schema/表（带重试）
         if not self._setup_schema_and_tables(db_url):
             return self._create_fallback_checkpointer()

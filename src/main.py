@@ -425,10 +425,12 @@ async_graph: Optional[CompiledStateGraph] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     engine = get_engine()
-    @event.listens_for(engine, "connect")
-    def _set_utc(dbapi_conn, _):
-        with dbapi_conn.cursor() as cur:
+    if engine.dialect.name != "sqlite":
+        @event.listens_for(engine, "connect")
+        def _set_utc(dbapi_conn, _):
+            cur = dbapi_conn.cursor()
             cur.execute("SET TIME ZONE 'UTC'")
+            cur.close()
     checkpointer = get_memory_saver()
     if _is_agent_proj():
         base = _get_agent_instance("agents.agent", None)
