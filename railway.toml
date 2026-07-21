@@ -1,15 +1,11 @@
-[build]
-  builder = "nixpacks"
-
-[deploy]
-  startCommand = "PYTHONPATH=/app/src python -m uvicorn main:app --host 0.0.0.0 --port 8002"
-
 [service]
   name = "denim-view"
 
-  [service.env]
-    PGDATABASE_URL = "${{Postgres.DATABASE_URL}}"
-    OPENAI_MODEL = "deepseek-v4-pro"
-    OPENAI_BASE_URL = "https://api.deepseek.com"
-    COZE_PROJECT_TYPE = "agent"
-    COZE_PROJECT_ENV = "PROD"
+[deploy]
+  startCommand = "cd src && uvicorn main:app --host 0.0.0.0 --port $PORT"
+
+[service.env]
+  PGDATABASE_URL = "${{Postgres.DATABASE_URL}}"
+  OPENAI_MODEL = "deepseek-v4-pro"
+  OPENAI_BASE_URL = "https://api.deepseek.com"
+  COZE_PROJECT_TYPE = "agent"
