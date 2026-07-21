@@ -18,11 +18,14 @@ except Exception:
     pass
 
 def get_db_url() -> str:
-    """Build database URL from environment."""
-    url = os.getenv("PGDATABASE_URL") or ""
+    """Build database URL from environment.
+
+    Priority: PGDATABASE_URL > DATABASE_URL (Railway auto-inject)
+    """
+    url = os.getenv("PGDATABASE_URL") or os.getenv("DATABASE_URL") or ""
     if not url:
-        logger.error("PGDATABASE_URL is not set — please set it in .env or environment")
-        raise ValueError("PGDATABASE_URL is not set")
+        logger.error("PGDATABASE_URL (or DATABASE_URL) is not set — please set it in .env or environment")
+        raise ValueError("PGDATABASE_URL (or DATABASE_URL) is not set")
     return url
 _engine = None
 _SessionLocal = None
